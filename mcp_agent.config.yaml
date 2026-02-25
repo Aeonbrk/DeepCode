@@ -109,26 +109,16 @@ llm_provider: "openai"  # 设置为 "google", "anthropic", 或 "openai"
 
 #openrouter can be used here and openai professional key
 openai:
-  base_max_tokens: 40000
-  default_model: "google/gemini-3-flash-preview"
-  planning_model: "google/gemini-3-flash-preview"
-  implementation_model: "google/gemini-3-flash-preview"
-  reasoning_effort: low  # Only for thinking models
+  base_max_tokens: 256000
+  default_model: "gpt-5.2"
+  planning_model: "gpt-5.2"
+  implementation_model: "gpt-5.3-codex"
+  reasoning_effort: xhigh  # Only for thinking models
   max_tokens_policy: adaptive
-  retry_max_tokens: 32768
+  retry_max_tokens: 256000
 
 # Provider configurations
 # default_model is used by mcp_agent for planning/analysis phases
 # implementation_model is used by code_implementation_workflow for code generation
-google:
-  default_model: "gemini-3-pro-preview"
-  planning_model: "gemini-3-pro-preview"
-  implementation_model: "gemini-2.5-flash"
-
-anthropic:
-  default_model: "claude-sonnet-4.5"
-  planning_model: "claude-sonnet-4.5"
-  implementation_model: "claude-sonnet-3.5"
-
 
 planning_mode: traditional
