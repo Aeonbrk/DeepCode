@@ -165,11 +165,20 @@ class WorkflowService:
         try:
             progress_callback = await self._create_progress_callback(task_id)
 
-            # Change to project root directory for MCP server paths to work correctly
-            original_cwd = os.getcwd()
-            os.chdir(PROJECT_ROOT)
+            # Ensure CWD is the project root so relative config paths resolve consistently.
+            if os.getcwd() != str(PROJECT_ROOT):
+                os.chdir(PROJECT_ROOT)
 
             # Create MCP app context with explicit config path
+            # Compat: allow OpenAI reasoning_effort values (e.g. xhigh) used by
+            # some OpenAI-compatible gateways.
+            from utils.mcp_agent_compat import (
+                patch_mcp_agent_openai_reasoning_effort,
+                patch_mcp_agent_openai_base_url_routing,
+            )
+
+            patch_mcp_agent_openai_reasoning_effort()
+            patch_mcp_agent_openai_base_url_routing()
             app = MCPApp(name="paper_to_code", settings=str(CONFIG_PATH))
 
             async with app.run() as agent_app:
@@ -228,8 +237,8 @@ class WorkflowService:
             return {"status": "error", "error": str(e)}
 
         finally:
-            # Restore original working directory
-            os.chdir(original_cwd)
+            # Do not restore CWD; the backend stabilizes it at startup.
+            pass
 
     async def execute_chat_planning(
         self,
@@ -255,11 +264,20 @@ class WorkflowService:
         try:
             progress_callback = await self._create_progress_callback(task_id)
 
-            # Change to project root directory for MCP server paths to work correctly
-            original_cwd = os.getcwd()
-            os.chdir(PROJECT_ROOT)
+            # Ensure CWD is the project root so relative config paths resolve consistently.
+            if os.getcwd() != str(PROJECT_ROOT):
+                os.chdir(PROJECT_ROOT)
 
             # Create MCP app context with explicit config path
+            # Compat: allow OpenAI reasoning_effort values (e.g. xhigh) used by
+            # some OpenAI-compatible gateways.
+            from utils.mcp_agent_compat import (
+                patch_mcp_agent_openai_reasoning_effort,
+                patch_mcp_agent_openai_base_url_routing,
+            )
+
+            patch_mcp_agent_openai_reasoning_effort()
+            patch_mcp_agent_openai_base_url_routing()
             app = MCPApp(name="chat_planning", settings=str(CONFIG_PATH))
 
             async with app.run() as agent_app:
@@ -364,8 +382,8 @@ class WorkflowService:
             return {"status": "error", "error": str(e)}
 
         finally:
-            # Restore original working directory
-            os.chdir(original_cwd)
+            # Do not restore CWD; the backend stabilizes it at startup.
+            pass
 
     def cancel_task(self, task_id: str) -> bool:
         """Cancel a running task"""

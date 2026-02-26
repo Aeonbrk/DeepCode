@@ -32,9 +32,17 @@ def load_config(config_path: Path | None = None) -> Config:
     path = config_path or get_config_path()
 
     if path.exists():
+        if path.is_dir():
+            print(f"Warning: Config path is a directory (expected a file): {path}")
+            print("Using default configuration.")
+            return Config()
         try:
             with open(path) as f:
                 data = json.load(f)
+            # Allow a lightweight comment field in config templates without
+            # weakening schema validation for other keys.
+            if isinstance(data, dict):
+                data.pop("_comment", None)
             data = _migrate_config(data)
             return Config.model_validate(convert_keys(data))
         except (json.JSONDecodeError, ValueError) as e:

@@ -433,9 +433,12 @@
         "reasoning_effort": {
           "default": "medium",
           "enum": [
+            "none",
+            "minimal",
             "low",
             "medium",
-            "high"
+            "high",
+            "xhigh"
           ],
           "title": "Reasoning Effort",
           "type": "string"

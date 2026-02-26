@@ -353,11 +353,16 @@ class CodeIndexer:
                 # Handle custom base_url if specified
                 openai_config = self.api_config.get("openai", {})
                 base_url = openai_config.get("base_url")
+                default_query = openai_config.get("default_query")
 
                 if base_url:
-                    client = AsyncOpenAI(api_key=openai_key, base_url=base_url)
+                    client = AsyncOpenAI(
+                        api_key=openai_key,
+                        base_url=base_url,
+                        default_query=default_query,
+                    )
                 else:
-                    client = AsyncOpenAI(api_key=openai_key)
+                    client = AsyncOpenAI(api_key=openai_key, default_query=default_query)
 
                 # Test connection with default model from config
                 await client.chat.completions.create(

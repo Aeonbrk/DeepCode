@@ -71,6 +71,47 @@ ensure_dirs() {
     echo -e "${GREEN}✓ 数据目录已就绪 (deepcode_lab/, uploads/, logs/)${NC}"
 }
 
+# ============ 检查 nanobot 配置文件 ============
+check_nanobot_config() {
+    local cfg="$PROJECT_ROOT/nanobot_config.json"
+    local tpl="$PROJECT_ROOT/nanobot_config.json.example"
+
+    # Template is part of the repo. If it is missing, Docker bind-mount may
+    # create a directory at the target path, causing nanobot to crash.
+    if [ ! -f "$tpl" ]; then
+        echo -e "${RED}❌ 缺少 nanobot_config.json.example 模板文件${NC}"
+        echo -e "${RED}   该文件用于生成 nanobot_config.json（挂载到 /root/.nanobot/config.json）${NC}"
+        exit 1
+    fi
+
+    if [ ! -e "$cfg" ]; then
+        echo -e "${YELLOW}⚠ 未找到 nanobot_config.json${NC}"
+        echo -e "${YELLOW}  正在从模板创建...${NC}"
+        cp "$tpl" "$cfg"
+        echo -e "${YELLOW}  ⚡ 请编辑 nanobot_config.json 填入你的 token / API Key（飞书/Telegram 等）${NC}"
+        return 0
+    fi
+
+    if [ -d "$cfg" ]; then
+        # Safe auto-fix: only repair if it's an empty directory.
+        if [ -z "$(ls -A "$cfg" 2>/dev/null)" ]; then
+            echo -e "${YELLOW}⚠ nanobot_config.json 是空目录，正在修复为配置文件...${NC}"
+            rmdir "$cfg"
+            cp "$tpl" "$cfg"
+            echo -e "${YELLOW}  ⚡ 请编辑 nanobot_config.json 填入你的 token / API Key（飞书/Telegram 等）${NC}"
+            return 0
+        fi
+
+        echo -e "${RED}❌ nanobot_config.json 当前是目录且非空: $cfg${NC}"
+        echo -e "${RED}   Docker 需要一个 JSON 文件用于挂载到 /root/.nanobot/config.json${NC}"
+        echo -e "${RED}   请将该目录改名/移走，然后从模板创建配置文件：${NC}"
+        echo -e "${RED}     cp nanobot_config.json.example nanobot_config.json${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}✓ nanobot_config.json 已找到${NC}"
+}
+
 # ============ 解析命令行参数 ============
 ACTION="up"
 BUILD_FLAG=""
@@ -153,6 +194,7 @@ case $ACTION in
         check_docker
         check_config
         ensure_dirs
+        check_nanobot_config
 
         echo ""
         echo -e "${BLUE}🐳 启动 DeepCode Docker 容器...${NC}"
@@ -203,6 +245,9 @@ case $ACTION in
 
     restart)
         check_docker
+        check_config
+        ensure_dirs
+        check_nanobot_config
         echo -e "${BLUE}🔄 重启 DeepCode 容器...${NC}"
         dc down
         dc up -d $BUILD_FLAG

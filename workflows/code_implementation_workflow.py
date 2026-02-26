@@ -587,11 +587,16 @@ Requirements:
 
                 openai_config = self.api_config.get("openai", {})
                 base_url = openai_config.get("base_url")
+                default_query = openai_config.get("default_query")
 
                 if base_url:
-                    client = AsyncOpenAI(api_key=openai_key, base_url=base_url)
+                    client = AsyncOpenAI(
+                        api_key=openai_key,
+                        base_url=base_url,
+                        default_query=default_query,
+                    )
                 else:
-                    client = AsyncOpenAI(api_key=openai_key)
+                    client = AsyncOpenAI(api_key=openai_key, default_query=default_query)
 
                 model_name = self.default_models.get("openai", "o3-mini")
 

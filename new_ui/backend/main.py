@@ -59,6 +59,20 @@ async def lifespan(app: FastAPI):
     print(f"  Backend dir:  {BACKEND_DIR}")
     print(f"  Mode:         {'Docker/Production' if IS_DOCKER else 'Development'}")
 
+    # Keep a stable CWD for the whole backend process so relative paths in
+    # `mcp_agent.config.yaml` and `logger.path_settings.path_pattern` resolve
+    # consistently across async requests.
+    try:
+        os.chdir(PROJECT_ROOT)
+    except Exception as e:
+        print(f"  ⚠️  Failed to set CWD to project root: {e}")
+
+    # Ensure logs dir exists for mcp-agent JSONL file transport.
+    try:
+        (PROJECT_ROOT / "logs").mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"  ⚠️  Failed to ensure logs/ directory exists: {e}")
+
     if IS_DOCKER and FRONTEND_DIST.exists():
         print(f"  Frontend:     Serving static files from {FRONTEND_DIST}")
     elif IS_DOCKER:

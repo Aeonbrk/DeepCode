@@ -1,5 +1,4 @@
 {
-  "_comment": "nanobot configuration for DeepCode integration. Copy to nanobot_config.json and fill in your keys.",
   "channels": {
     "feishu": {
       "enabled": true,

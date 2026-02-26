@@ -83,6 +83,25 @@ def load_api_config(secrets_path: str = "mcp_agent.secrets.yaml") -> Dict[str, A
         if key:
             config.setdefault(provider, {})["api_key"] = key
 
+    # Normalize OpenAI base_url for the official SDK:
+    # allow users to specify endpoint-style URLs (e.g. ".../responses" or
+    # ".../chat/completions") without breaking path joining.
+    try:
+        from utils.openai_compat import get_openai_base_url_info
+
+        openai_cfg = config.get("openai")
+        if isinstance(openai_cfg, dict):
+            info = get_openai_base_url_info(openai_cfg.get("base_url"))
+            openai_cfg["base_url"] = info.sdk_base_url
+            # OpenAI's SDK cannot safely merge paths when query params live inside
+            # `base_url` (httpx `raw_path` includes the query), so keep query in
+            # `default_query` instead.
+            if info.default_query:
+                openai_cfg["default_query"] = info.default_query
+    except Exception:
+        # Best-effort; keep raw config if normalization fails for any reason.
+        pass
+
     return config
 
 
