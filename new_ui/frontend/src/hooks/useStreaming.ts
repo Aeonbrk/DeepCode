@@ -5,11 +5,12 @@ import type {
   WSProgressMessage,
   WSCompleteMessage,
   WSErrorMessage,
+  WSCancelledMessage,
   WSCodeChunkMessage,
   WSInteractionMessage,
 } from '../types/api';
 
-type WSMessage = WSProgressMessage | WSCompleteMessage | WSErrorMessage | WSCodeChunkMessage | WSInteractionMessage;
+type WSMessage = WSProgressMessage | WSCompleteMessage | WSErrorMessage | WSCancelledMessage | WSCodeChunkMessage | WSInteractionMessage;
 
 export function useStreaming(taskId: string | null) {
   const {
@@ -30,7 +31,7 @@ export function useStreaming(taskId: string | null) {
   const prevTaskIdRef = useRef<string | null>(null);
 
   // Determine if finished based on store status (persisted state)
-  const isFinished = status === 'completed' || status === 'error';
+  const isFinished = status === 'completed' || status === 'error' || status === 'cancelled';
 
   const handleMessage = useCallback(
     (message: WSMessage) => {
@@ -109,6 +110,13 @@ export function useStreaming(taskId: string | null) {
             clearInteraction(); // Clear any pending interaction
             addActivityLog(`❌ Error: ${message.error}`, 0, 'error');
           }
+          break;
+
+        case 'cancelled':
+          setStatus('cancelled');
+          clearInteraction();
+          setCurrentFile(null);
+          addActivityLog(`⏹️ ${message.reason || message.message || 'Workflow cancelled'}`, 0, 'warning');
           break;
 
         case 'code_chunk':

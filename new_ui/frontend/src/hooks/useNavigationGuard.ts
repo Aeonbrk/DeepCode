@@ -6,29 +6,14 @@
  * - Shows confirmation dialog on in-app navigation
  */
 
-import { useEffect, useCallback, useState } from 'react';
-import { useNavigate, useLocation } from 'react-router-dom';
+import { useCallback, useEffect } from 'react';
+import { useBlocker } from 'react-router-dom';
 import { useWorkflowStore } from '../stores/workflowStore';
 
-interface NavigationGuardState {
-  isBlocking: boolean;
-  pendingPath: string | null;
-  showConfirmDialog: boolean;
-}
-
 export function useNavigationGuard() {
-  const { status } = useWorkflowStore();
-  const navigate = useNavigate();
-  const location = useLocation();
-
-  const [guardState, setGuardState] = useState<NavigationGuardState>({
-    isBlocking: false,
-    pendingPath: null,
-    showConfirmDialog: false,
-  });
-
-  // Determine if we should block navigation
-  const shouldBlock = status === 'running';
+  const { status, isWaitingForInput } = useWorkflowStore();
+  const shouldBlock = status === 'running' || isWaitingForInput === true;
+  const blocker = useBlocker(shouldBlock);
 
   // Handle browser beforeunload event (refresh, close tab, close browser)
   useEffect(() => {
@@ -45,51 +30,23 @@ export function useNavigationGuard() {
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, [shouldBlock]);
 
-  // Update blocking state
-  useEffect(() => {
-    setGuardState(prev => ({ ...prev, isBlocking: shouldBlock }));
-  }, [shouldBlock]);
-
-  // Function to attempt navigation (called by NavLink wrapper)
-  const attemptNavigation = useCallback((path: string) => {
-    if (shouldBlock && path !== location.pathname) {
-      setGuardState({
-        isBlocking: true,
-        pendingPath: path,
-        showConfirmDialog: true,
-      });
-      return false; // Block navigation
-    }
-    return true; // Allow navigation
-  }, [shouldBlock, location.pathname]);
-
   // Confirm navigation (user clicked "Leave" in dialog)
   const confirmNavigation = useCallback(() => {
-    const { pendingPath } = guardState;
-    setGuardState({
-      isBlocking: false,
-      pendingPath: null,
-      showConfirmDialog: false,
-    });
-    if (pendingPath) {
-      navigate(pendingPath);
+    if (blocker.state === 'blocked') {
+      blocker.proceed();
     }
-  }, [guardState.pendingPath, navigate]);
+  }, [blocker]);
 
   // Cancel navigation (user clicked "Stay" in dialog)
   const cancelNavigation = useCallback(() => {
-    setGuardState(prev => ({
-      ...prev,
-      pendingPath: null,
-      showConfirmDialog: false,
-    }));
-  }, []);
+    if (blocker.state === 'blocked') {
+      blocker.reset();
+    }
+  }, [blocker]);
 
   return {
-    isBlocking: guardState.isBlocking,
-    showConfirmDialog: guardState.showConfirmDialog,
-    pendingPath: guardState.pendingPath,
-    attemptNavigation,
+    isBlocking: shouldBlock,
+    showConfirmDialog: blocker.state === 'blocked',
     confirmNavigation,
     cancelNavigation,
   };

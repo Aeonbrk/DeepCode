@@ -3,6 +3,7 @@ import Editor from '@monaco-editor/react';
 import { motion } from 'framer-motion';
 import { Code, Copy, Check, Loader2 } from 'lucide-react';
 import { useState } from 'react';
+import type { editor } from 'monaco-editor';
 
 interface CodeStreamViewerProps {
   code: string;
@@ -18,7 +19,7 @@ export default function CodeStreamViewer({
   language = 'python',
 }: CodeStreamViewerProps) {
   const [copied, setCopied] = useState(false);
-  const editorRef = useRef<any>(null);
+  const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
 
   // Auto-scroll to bottom when code updates
   useEffect(() => {

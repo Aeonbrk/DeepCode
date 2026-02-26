@@ -130,13 +130,13 @@ async def respond_to_interaction(task_id: str, request: InteractionResponseReque
             detail=f"Task is not waiting for input (current status: {task.status})",
         )
 
-    # Check if plugin integration is available
-    if not hasattr(workflow_service, "_plugin_integration"):
+    plugin = workflow_service._get_plugin_integration()
+    if plugin is None:
         raise HTTPException(
             status_code=501, detail="User-in-Loop plugin system not enabled"
         )
 
-    success = workflow_service._plugin_integration.submit_response(
+    success = plugin.submit_response(
         task_id=task_id,
         action=request.action,
         data=request.data,

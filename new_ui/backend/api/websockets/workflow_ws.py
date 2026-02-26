@@ -65,17 +65,11 @@ async def workflow_websocket(websocket: WebSocket, task_id: str):
         "error": str | null  # Only for error type
     }
     """
-    await manager.connect(websocket, task_id)
-    print(f"[WorkflowWS] Connected: task={task_id[:8]}...")
-
-    # Subscribe to get our own queue for this task
-    queue = workflow_service.subscribe(task_id)
+    connected = False
+    queue = None
     task = workflow_service.get_task(task_id)
-    print(
-        f"[WorkflowWS] Subscribed: task={task_id[:8]}... queue={queue is not None} task={task is not None}"
-    )
-
     if not task:
+        await websocket.accept()
         await websocket.send_json(
             {
                 "type": "error",
@@ -87,38 +81,60 @@ async def workflow_websocket(websocket: WebSocket, task_id: str):
         await websocket.close()
         return
 
-    # Send current status
-    await websocket.send_json(
-        {
-            "type": "status",
-            "task_id": task_id,
-            "status": task.status,
-            "progress": task.progress,
-            "message": task.message,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
+    await manager.connect(websocket, task_id)
+    connected = True
+    print(f"[WorkflowWS] Connected: task={task_id[:8]}...")
+
+    # Subscribe to get our own queue for this task
+    queue = workflow_service.subscribe(task_id)
+    print(
+        f"[WorkflowWS] Subscribed: task={task_id[:8]}... queue={queue is not None} task={task is not None}"
     )
 
-    # Send pending interaction if any (fixes race condition where interaction_required
-    # was broadcast before WebSocket connected)
-    if task.pending_interaction:
-        print(f"[WorkflowWS] Sending missed pending interaction: task={task_id[:8]}...")
+    try:
+        if task.status == "cancelled":
+            await websocket.send_json(
+                {
+                    "type": "cancelled",
+                    "task_id": task_id,
+                    "reason": task.message or "Cancelled by user",
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+            )
+            await websocket.close()
+            return
+
+        # Send current status
         await websocket.send_json(
             {
-                "type": "interaction_required",
+                "type": "status",
                 "task_id": task_id,
-                "interaction_type": task.pending_interaction.get("type"),
-                "title": task.pending_interaction.get("title"),
-                "description": task.pending_interaction.get("description"),
-                "data": task.pending_interaction.get("data"),
-                "options": task.pending_interaction.get("options"),
-                "required": task.pending_interaction.get("required"),
+                "status": task.status,
+                "progress": task.progress,
+                "message": task.message,
                 "timestamp": datetime.utcnow().isoformat(),
             }
         )
 
-    try:
-        # If task is already completed, send final status and close
+        # Send pending interaction if any (fixes race condition where interaction_required
+        # was broadcast before WebSocket connected)
+        if task.pending_interaction:
+            print(f"[WorkflowWS] Sending missed pending interaction: task={task_id[:8]}...")
+            await websocket.send_json(
+                {
+                    "type": "interaction_required",
+                    "task_id": task_id,
+                    "interaction_type": task.pending_interaction.get("type"),
+                    "title": task.pending_interaction.get("title"),
+                    "description": task.pending_interaction.get("description"),
+                    "data": task.pending_interaction.get("data"),
+                    "options": task.pending_interaction.get("options"),
+                    "required": task.pending_interaction.get("required"),
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+            )
+
+        # If task is already completed/cancelled, send final status and close
         if task.status in ("completed", "error", "cancelled"):
             if task.status == "completed":
                 await websocket.send_json(
@@ -135,6 +151,15 @@ async def workflow_websocket(websocket: WebSocket, task_id: str):
                         "type": "error",
                         "task_id": task_id,
                         "error": task.error,
+                        "timestamp": datetime.utcnow().isoformat(),
+                    }
+                )
+            else:
+                await websocket.send_json(
+                    {
+                        "type": "cancelled",
+                        "task_id": task_id,
+                        "reason": task.message or "Cancelled by user",
                         "timestamp": datetime.utcnow().isoformat(),
                     }
                 )
@@ -155,7 +180,7 @@ async def workflow_websocket(websocket: WebSocket, task_id: str):
                     await websocket.send_json(message)
 
                     # Check if workflow is complete
-                    if msg_type in ("complete", "error"):
+                    if msg_type in ("complete", "error", "cancelled"):
                         print(
                             f"[WorkflowWS] Workflow finished: task={task_id[:8]}... type={msg_type}"
                         )
@@ -177,7 +202,8 @@ async def workflow_websocket(websocket: WebSocket, task_id: str):
     except WebSocketDisconnect:
         pass
     finally:
-        manager.disconnect(websocket, task_id)
+        if connected:
+            manager.disconnect(websocket, task_id)
         # Unsubscribe from task updates
         if queue:
             workflow_service.unsubscribe(task_id, queue)

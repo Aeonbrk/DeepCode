@@ -34,7 +34,7 @@ interface SessionState {
 
 export const useSessionStore = create<SessionState>()(
   persist(
-    (set, _get) => ({
+    (set) => ({
       sessionId: null,
       conversationHistory: [],
       preferences: {

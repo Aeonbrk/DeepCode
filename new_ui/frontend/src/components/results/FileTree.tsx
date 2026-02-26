@@ -1,12 +1,8 @@
 import { useState } from 'react';
 import { ChevronRight, ChevronDown, File, Folder, FolderOpen } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-
-interface FileNode {
-  name: string;
-  type: 'file' | 'folder';
-  children?: FileNode[];
-}
+import { buildTree } from '../../utils/fileTree';
+import type { FileNode } from '../../utils/fileTree';
 
 interface FileTreeProps {
   files: string[];
@@ -15,43 +11,6 @@ interface FileTreeProps {
 }
 
 export default function FileTree({ files, onFileSelect, selectedFile }: FileTreeProps) {
-  // Convert flat file list to tree structure
-  const buildTree = (paths: string[]): FileNode[] => {
-    const root: Record<string, FileNode> = {};
-
-    paths.forEach((path) => {
-      const parts = path.split('/').filter(Boolean);
-      let current = root;
-
-      parts.forEach((part, index) => {
-        const isFile = index === parts.length - 1;
-
-        if (!current[part]) {
-          current[part] = {
-            name: part,
-            type: isFile ? 'file' : 'folder',
-            children: isFile ? undefined : ({} as unknown as FileNode[]),
-          };
-        }
-
-        if (!isFile) {
-          current = current[part].children as unknown as Record<string, FileNode>;
-        }
-      });
-    });
-
-    const convertToArray = (obj: Record<string, FileNode>): FileNode[] => {
-      return Object.values(obj).map((node) => ({
-        ...node,
-        children: node.children
-          ? convertToArray(node.children as unknown as Record<string, FileNode>)
-          : undefined,
-      }));
-    };
-
-    return convertToArray(root);
-  };
-
   const tree = buildTree(files);
 
   return (

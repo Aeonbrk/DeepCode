@@ -51,6 +51,12 @@ async def code_stream_websocket(websocket: WebSocket, task_id: str):
         # Track current file being streamed
         current_file = None
 
+        # Code-stream channel is non-authoritative for terminal state.
+        # If task is already terminal, close immediately and let workflow WS be the source of truth.
+        if task.status in ("completed", "error", "cancelled"):
+            await websocket.close()
+            return
+
         if queue:
             while True:
                 try:
@@ -82,17 +88,6 @@ async def code_stream_websocket(websocket: WebSocket, task_id: str):
                                 }
                             )
 
-                        # Forward progress message
-                        await websocket.send_json(
-                            {
-                                "type": "progress",
-                                "task_id": task_id,
-                                "progress": message.get("progress", 0),
-                                "message": msg_text,
-                                "timestamp": datetime.utcnow().isoformat(),
-                            }
-                        )
-
                     elif message.get("type") == "code_chunk":
                         # Direct code chunk forwarding
                         await websocket.send_json(
@@ -105,7 +100,7 @@ async def code_stream_websocket(websocket: WebSocket, task_id: str):
                             }
                         )
 
-                    elif message.get("type") in ("complete", "error"):
+                    elif message.get("type") in ("complete", "error", "cancelled"):
                         msg_type = message.get("type")
                         print(
                             f"[CodeStreamWS] Workflow finished: task={task_id[:8]}... type={msg_type}"
@@ -117,9 +112,10 @@ async def code_stream_websocket(websocket: WebSocket, task_id: str):
                                     "task_id": task_id,
                                     "filename": current_file,
                                     "timestamp": datetime.utcnow().isoformat(),
-                                }
-                            )
-                        await websocket.send_json(message)
+                                    }
+                                )
+                        # Do not forward terminal events from code-stream channel to avoid
+                        # duplicating workflow terminal handling on the frontend.
                         # Wait a bit before closing to ensure frontend processes the message
                         await asyncio.sleep(0.5)
                         await websocket.close()

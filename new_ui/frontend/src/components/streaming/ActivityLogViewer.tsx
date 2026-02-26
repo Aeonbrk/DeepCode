@@ -131,7 +131,7 @@ export default function ActivityLogViewer({
           </div>
         ) : (
           <AnimatePresence mode="popLayout">
-            {logs.map((log, _index) => (
+            {logs.map((log) => (
               <motion.div
                 key={log.id}
                 initial={{ opacity: 0, x: -20 }}

@@ -25,7 +25,7 @@ export function TaskRecoveryBanner({
 
   const handleGoToTask = () => {
     if (workflowType === 'chat-planning') {
-      navigate('/chat-planning');
+      navigate('/chat');
     } else if (workflowType === 'paper-to-code') {
       navigate('/paper-to-code');
     }
@@ -38,7 +38,7 @@ export function TaskRecoveryBanner({
   }
 
   // Don't show if task is completed or has error
-  if (status === 'completed' || status === 'error' || status === 'idle') {
+  if (status === 'completed' || status === 'error' || status === 'cancelled' || status === 'idle') {
     return null;
   }
 

@@ -4,6 +4,8 @@ Handles LLM provider and settings management
 """
 
 from fastapi import APIRouter, HTTPException
+import os
+import tempfile
 import yaml
 
 from settings import (
@@ -75,8 +77,29 @@ async def set_llm_provider(request: LLMProviderUpdateRequest):
         config = load_mcp_config()
         config["llm_provider"] = request.provider
 
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            yaml.dump(config, f, default_flow_style=False)
+        config_dir = os.path.dirname(CONFIG_PATH)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=config_dir,
+                delete=False,
+            ) as temp_file:
+                yaml.safe_dump(config, temp_file, sort_keys=False)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+                temp_path = temp_file.name
+
+            os.replace(temp_path, CONFIG_PATH)
+            dir_fd = os.open(config_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
 
         return {
             "status": "success",
