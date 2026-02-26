@@ -410,17 +410,22 @@ def _responses_to_chat_completion(response: Any) -> Any:
     finish_reason = "tool_calls" if tool_calls else "stop"
     choice = Choice(index=0, finish_reason=finish_reason, message=msg)
 
-    usage = None
+    usage = CompletionUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0)
     try:
         if getattr(response, "usage", None) is not None:
             u = response.usage
+            prompt_tokens = getattr(u, "input_tokens", 0) or 0
+            completion_tokens = getattr(u, "output_tokens", 0) or 0
+            total_tokens = getattr(u, "total_tokens", None)
+            if total_tokens is None:
+                total_tokens = prompt_tokens + completion_tokens
             usage = CompletionUsage(
-                prompt_tokens=getattr(u, "input_tokens", 0),
-                completion_tokens=getattr(u, "output_tokens", 0),
-                total_tokens=getattr(u, "total_tokens", 0),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
             )
     except Exception:
-        usage = None
+        usage = CompletionUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0)
 
     created = 0
     try:
@@ -436,6 +441,69 @@ def _responses_to_chat_completion(response: Any) -> Any:
         choices=[choice],
         usage=usage,
     )
+
+
+def _ensure_chat_completion_usage(response: Any) -> Any:
+    """
+    Ensure ChatCompletion-like responses always include `usage`.
+
+    Some OpenAI-compatible gateways omit usage metadata entirely; upstream
+    `mcp-agent` currently dereferences `response.usage.prompt_tokens` directly.
+    """
+    from openai.types.completion_usage import CompletionUsage
+
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        # Normalize partially-filled usage fields to avoid None arithmetic.
+        prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+        completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+        total_tokens = getattr(usage, "total_tokens", 0)
+        if total_tokens is None:
+            total_tokens = prompt_tokens + completion_tokens
+        try:
+            if (
+                prompt_tokens == usage.prompt_tokens
+                and completion_tokens == usage.completion_tokens
+                and total_tokens == usage.total_tokens
+            ):
+                return response
+        except Exception:
+            pass
+    else:
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
+
+    normalized_usage = CompletionUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
+    model_copy = getattr(response, "model_copy", None)
+    if callable(model_copy):
+        try:
+            return model_copy(update={"usage": normalized_usage})
+        except Exception:
+            pass
+
+    # Secondary fallback: rebuild from dumped data for immutable objects.
+    model_dump = getattr(response, "model_dump", None)
+    if callable(model_dump):
+        try:
+            from openai.types.chat import ChatCompletion
+
+            data = model_dump()
+            if isinstance(data, dict):
+                data["usage"] = normalized_usage.model_dump()
+                return ChatCompletion.model_validate(data)
+        except Exception:
+            pass
+
+    try:
+        response.usage = normalized_usage
+    except Exception:
+        pass
+    return response
 
 
 def patch_mcp_agent_openai_base_url_routing() -> None:
@@ -510,7 +578,7 @@ def patch_mcp_agent_openai_base_url_routing() -> None:
             if info.endpoint_hint != OpenAIEndpointHint.RESPONSES:
                 try:
                     response = await client.chat.completions.create(**request.payload)
-                    return ensure_serializable(response)
+                    return ensure_serializable(_ensure_chat_completion_usage(response))
                 except non_retryable as exc:
                     raise to_application_error(exc, non_retryable=True) from exc
 
@@ -524,7 +592,7 @@ def patch_mcp_agent_openai_base_url_routing() -> None:
                 raise to_application_error(exc, non_retryable=True) from exc
 
             completion = _responses_to_chat_completion(resp)
-            return ensure_serializable(completion)
+            return ensure_serializable(_ensure_chat_completion_usage(completion))
 
     async def _request_structured_completion_task_patched(
         request: RequestStructuredCompletionRequest,
