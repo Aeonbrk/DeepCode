@@ -8,6 +8,7 @@ Communication: HTTP requests to DeepCode's FastAPI backend.
 In Docker Compose: nanobot -> http://deepcode:8000/api/v1/...
 """
 
+import asyncio
 import os
 from typing import Any
 
@@ -21,11 +22,124 @@ def _get_deepcode_url() -> str:
     return os.environ.get("DEEPCODE_API_URL", "http://deepcode:8000")
 
 
-class DeepCodePaper2CodeTool(Tool):
+_MAX_RETRIES = 2
+_BASE_RETRY_DELAY_SECONDS = 0.5
+_TRANSIENT_STATUS_CODES = {502, 503, 504}
+
+_SHARED_CLIENTS: dict[str, httpx.AsyncClient] = {}
+
+
+def _get_shared_client(api_url: str) -> httpx.AsyncClient:
+    client = _SHARED_CLIENTS.get(api_url)
+    if client is None:
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+        _SHARED_CLIENTS[api_url] = client
+    return client
+
+
+def _truncate(text: str, limit: int = 800) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def _try_get_error_detail(response: httpx.Response) -> str | None:
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+
+    if isinstance(payload, dict):
+        detail = payload.get("detail") or payload.get("message") or payload.get("error")
+        if detail is not None:
+            return _truncate(str(detail), 500)
+    return None
+
+
+def _format_http_status_error(e: httpx.HTTPStatusError) -> str:
+    detail = _try_get_error_detail(e.response)
+    if detail:
+        return f"Error: DeepCode API returned status {e.response.status_code}: {detail}"
+    return f"Error: DeepCode API returned status {e.response.status_code}."
+
+
+async def _request_with_retries(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    json: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+    timeout: float | httpx.Timeout | None = None,
+) -> httpx.Response:
+    delay = _BASE_RETRY_DELAY_SECONDS
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            response = await client.request(
+                method,
+                url,
+                json=json,
+                params=params,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            return response
+        except httpx.HTTPStatusError as e:
+            if (
+                e.response.status_code in _TRANSIENT_STATUS_CODES
+                and attempt < _MAX_RETRIES
+            ):
+                await asyncio.sleep(delay)
+                delay *= 2
+                continue
+            raise
+        except httpx.RequestError:
+            if attempt < _MAX_RETRIES:
+                await asyncio.sleep(delay)
+                delay *= 2
+                continue
+            raise
+
+
+class _DeepCodeToolBase(Tool):
+    def __init__(self, api_url: str | None = None):
+        self._api_url = api_url or _get_deepcode_url()
+
+    def _get_client(self) -> httpx.AsyncClient:
+        return _get_shared_client(self._api_url)
+
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+        timeout: float | httpx.Timeout | None = None,
+    ) -> dict[str, Any]:
+        url = f"{self._api_url}{path}"
+        response = await _request_with_retries(
+            self._get_client(),
+            method,
+            url,
+            json=json,
+            params=params,
+            timeout=timeout,
+        )
+        try:
+            return response.json()
+        except ValueError:
+            return {}
+
+
+class DeepCodePaper2CodeTool(_DeepCodeToolBase):
     """Submit a paper (URL or file path) to DeepCode for automatic code reproduction."""
 
     def __init__(self, api_url: str | None = None):
-        self._api_url = api_url or _get_deepcode_url()
+        super().__init__(api_url=api_url)
 
     @property
     def name(self) -> str:
@@ -71,42 +185,38 @@ class DeepCodePaper2CodeTool(Tool):
         **kwargs: Any,
     ) -> str:
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    f"{self._api_url}/api/v1/workflows/paper-to-code",
-                    json={
-                        "input_source": input_source,
-                        "input_type": input_type,
-                        "enable_indexing": enable_indexing,
-                    },
-                )
-                response.raise_for_status()
-                data = response.json()
-                task_id = data.get("task_id", "unknown")
-                return (
-                    f"Paper-to-code task submitted successfully!\n"
-                    f"Task ID: {task_id}\n"
-                    f"Status: {data.get('status', 'started')}\n"
-                    f"Input: {input_source}\n"
-                    f"Indexing: {'enabled' if enable_indexing else 'disabled (fast mode)'}\n\n"
-                    f"The code generation is running in the background. "
-                    f"Use deepcode_status with task_id='{task_id}' to check progress."
-                )
+            data = await self._request_json(
+                "POST",
+                "/api/v1/workflows/paper-to-code",
+                json={
+                    "input_source": input_source,
+                    "input_type": input_type,
+                    "enable_indexing": enable_indexing,
+                },
+            )
+            task_id = data.get("task_id", "unknown")
+            return (
+                f"Paper-to-code task submitted successfully!\n"
+                f"Task ID: {task_id}\n"
+                f"Status: {data.get('status', 'started')}\n"
+                f"Input: {input_source}\n"
+                f"Indexing: {'enabled' if enable_indexing else 'disabled (fast mode)'}\n\n"
+                f"The code generation is running in the background. "
+                f"Use deepcode_status with task_id='{task_id}' to check progress."
+            )
         except httpx.ConnectError:
             return "Error: Cannot connect to DeepCode backend. Is the DeepCode service running?"
         except httpx.HTTPStatusError as e:
-            return (
-                f"Error: DeepCode API returned status {e.response.status_code}: {e.response.text}"
-            )
+            return _format_http_status_error(e)
         except Exception as e:
             return f"Error submitting paper to DeepCode: {str(e)}"
 
 
-class DeepCodeChat2CodeTool(Tool):
+class DeepCodeChat2CodeTool(_DeepCodeToolBase):
     """Submit text requirements to DeepCode for code generation."""
 
     def __init__(self, api_url: str | None = None):
-        self._api_url = api_url or _get_deepcode_url()
+        super().__init__(api_url=api_url)
 
     @property
     def name(self) -> str:
@@ -145,40 +255,36 @@ class DeepCodeChat2CodeTool(Tool):
         **kwargs: Any,
     ) -> str:
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    f"{self._api_url}/api/v1/workflows/chat-planning",
-                    json={
-                        "requirements": requirements,
-                        "enable_indexing": enable_indexing,
-                    },
-                )
-                response.raise_for_status()
-                data = response.json()
-                task_id = data.get("task_id", "unknown")
-                return (
-                    f"Chat-to-code task submitted successfully!\n"
-                    f"Task ID: {task_id}\n"
-                    f"Status: {data.get('status', 'started')}\n"
-                    f"Requirements: {requirements[:200]}{'...' if len(requirements) > 200 else ''}\n\n"
-                    f"The code generation is running in the background. "
-                    f"Use deepcode_status with task_id='{task_id}' to check progress."
-                )
+            data = await self._request_json(
+                "POST",
+                "/api/v1/workflows/chat-planning",
+                json={
+                    "requirements": requirements,
+                    "enable_indexing": enable_indexing,
+                },
+            )
+            task_id = data.get("task_id", "unknown")
+            return (
+                f"Chat-to-code task submitted successfully!\n"
+                f"Task ID: {task_id}\n"
+                f"Status: {data.get('status', 'started')}\n"
+                f"Requirements: {requirements[:200]}{'...' if len(requirements) > 200 else ''}\n\n"
+                f"The code generation is running in the background. "
+                f"Use deepcode_status with task_id='{task_id}' to check progress."
+            )
         except httpx.ConnectError:
             return "Error: Cannot connect to DeepCode backend. Is the DeepCode service running?"
         except httpx.HTTPStatusError as e:
-            return (
-                f"Error: DeepCode API returned status {e.response.status_code}: {e.response.text}"
-            )
+            return _format_http_status_error(e)
         except Exception as e:
             return f"Error submitting requirements to DeepCode: {str(e)}"
 
 
-class DeepCodeStatusTool(Tool):
+class DeepCodeStatusTool(_DeepCodeToolBase):
     """Check the status and progress of a DeepCode task."""
 
     def __init__(self, api_url: str | None = None):
-        self._api_url = api_url or _get_deepcode_url()
+        super().__init__(api_url=api_url)
 
     @property
     def name(self) -> str:
@@ -207,57 +313,56 @@ class DeepCodeStatusTool(Tool):
 
     async def execute(self, task_id: str, **kwargs: Any) -> str:
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.get(f"{self._api_url}/api/v1/workflows/status/{task_id}")
-                response.raise_for_status()
-                data = response.json()
+            data = await self._request_json(
+                "GET",
+                f"/api/v1/workflows/status/{task_id}",
+                timeout=15.0,
+            )
 
-                status = data.get("status", "unknown")
-                progress = data.get("progress", 0)
-                message = data.get("message", "")
-                result = data.get("result")
-                error = data.get("error")
+            status = data.get("status", "unknown")
+            progress = data.get("progress", 0)
+            message = data.get("message", "")
+            result = data.get("result")
+            error = data.get("error")
 
-                lines = [
-                    f"Task ID: {task_id}",
-                    f"Status: {status}",
-                    f"Progress: {progress}%",
-                ]
+            lines = [
+                f"Task ID: {task_id}",
+                f"Status: {status}",
+                f"Progress: {progress}%",
+            ]
 
-                if message:
-                    lines.append(f"Message: {message}")
+            if message:
+                lines.append(f"Message: {message}")
 
-                if status == "completed" and result:
-                    lines.append(f"\nResult:\n{result}")
-                elif status == "error" and error:
-                    lines.append(f"\nError: {error}")
-                elif status == "waiting_for_input":
-                    interaction = data.get("pending_interaction")
-                    if interaction:
-                        lines.append("\nWaiting for user input:")
-                        lines.append(f"  Type: {interaction.get('type', 'unknown')}")
-                        lines.append(f"  Title: {interaction.get('title', '')}")
-                        lines.append(f"  Description: {interaction.get('description', '')}")
+            if status == "completed" and result:
+                lines.append(f"\nResult:\n{result}")
+            elif status == "error" and error:
+                lines.append(f"\nError: {error}")
+            elif status == "waiting_for_input":
+                interaction = data.get("pending_interaction")
+                if interaction:
+                    lines.append("\nWaiting for user input:")
+                    lines.append(f"  Type: {interaction.get('type', 'unknown')}")
+                    lines.append(f"  Title: {interaction.get('title', '')}")
+                    lines.append(f"  Description: {interaction.get('description', '')}")
 
-                return "\n".join(lines)
+            return "\n".join(lines)
 
         except httpx.ConnectError:
             return "Error: Cannot connect to DeepCode backend. Is the DeepCode service running?"
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 return f"Error: Task '{task_id}' not found. It may have expired."
-            return (
-                f"Error: DeepCode API returned status {e.response.status_code}: {e.response.text}"
-            )
+            return _format_http_status_error(e)
         except Exception as e:
             return f"Error checking task status: {str(e)}"
 
 
-class DeepCodeListTasksTool(Tool):
+class DeepCodeListTasksTool(_DeepCodeToolBase):
     """List active and recent DeepCode tasks."""
 
     def __init__(self, api_url: str | None = None):
-        self._api_url = api_url or _get_deepcode_url()
+        super().__init__(api_url=api_url)
 
     @property
     def name(self) -> str:
@@ -286,65 +391,63 @@ class DeepCodeListTasksTool(Tool):
 
     async def execute(self, limit: int = 10, **kwargs: Any) -> str:
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                # Fetch active tasks
-                active_resp = await client.get(f"{self._api_url}/api/v1/workflows/active")
-                active_resp.raise_for_status()
-                active_data = active_resp.json()
+            active_data = await self._request_json(
+                "GET",
+                "/api/v1/workflows/active",
+                timeout=15.0,
+            )
+            recent_data = await self._request_json(
+                "GET",
+                "/api/v1/workflows/recent",
+                params={"limit": limit},
+                timeout=15.0,
+            )
 
-                # Fetch recent tasks
-                recent_resp = await client.get(
-                    f"{self._api_url}/api/v1/workflows/recent",
-                    params={"limit": limit},
-                )
-                recent_resp.raise_for_status()
-                recent_data = recent_resp.json()
+            lines = []
 
-                lines = []
+            active_tasks = active_data.get("tasks", [])
+            if active_tasks:
+                lines.append(f"=== Active Tasks ({len(active_tasks)}) ===")
+                for task in active_tasks:
+                    lines.append(
+                        f"  [{task.get('status', '?')}] {task.get('task_id', '?')} "
+                        f"- {task.get('progress', 0)}% - {task.get('message', '')}"
+                    )
+                lines.append("")
 
-                # Active tasks
-                active_tasks = active_data.get("tasks", [])
-                if active_tasks:
-                    lines.append(f"=== Active Tasks ({len(active_tasks)}) ===")
-                    for task in active_tasks:
-                        lines.append(
-                            f"  [{task.get('status', '?')}] {task.get('task_id', '?')} "
-                            f"- {task.get('progress', 0)}% - {task.get('message', '')}"
-                        )
-                    lines.append("")
+            recent_tasks = recent_data.get("tasks", [])
+            if recent_tasks:
+                lines.append(f"=== Recent Tasks ({len(recent_tasks)}) ===")
+                for task in recent_tasks:
+                    status_icon = {
+                        "completed": "done",
+                        "error": "error",
+                        "running": "running",
+                        "cancelled": "cancelled",
+                    }.get(task.get("status", ""), "?")
+                    lines.append(
+                        f"  [{status_icon}] {task.get('task_id', '?')} "
+                        f"- {task.get('status', '?')} - {task.get('message', '')}"
+                    )
 
-                # Recent tasks
-                recent_tasks = recent_data.get("tasks", [])
-                if recent_tasks:
-                    lines.append(f"=== Recent Tasks ({len(recent_tasks)}) ===")
-                    for task in recent_tasks:
-                        status_icon = {
-                            "completed": "done",
-                            "error": "error",
-                            "running": "running",
-                            "cancelled": "cancelled",
-                        }.get(task.get("status", ""), "?")
-                        lines.append(
-                            f"  [{status_icon}] {task.get('task_id', '?')} "
-                            f"- {task.get('status', '?')} - {task.get('message', '')}"
-                        )
+            if not lines:
+                return "No DeepCode tasks found."
 
-                if not lines:
-                    return "No DeepCode tasks found."
-
-                return "\n".join(lines)
+            return "\n".join(lines)
 
         except httpx.ConnectError:
             return "Error: Cannot connect to DeepCode backend. Is the DeepCode service running?"
+        except httpx.HTTPStatusError as e:
+            return _format_http_status_error(e)
         except Exception as e:
             return f"Error listing tasks: {str(e)}"
 
 
-class DeepCodeCancelTool(Tool):
+class DeepCodeCancelTool(_DeepCodeToolBase):
     """Cancel a running DeepCode task."""
 
     def __init__(self, api_url: str | None = None):
-        self._api_url = api_url or _get_deepcode_url()
+        super().__init__(api_url=api_url)
 
     @property
     def name(self) -> str:
@@ -369,27 +472,27 @@ class DeepCodeCancelTool(Tool):
 
     async def execute(self, task_id: str, **kwargs: Any) -> str:
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.post(f"{self._api_url}/api/v1/workflows/cancel/{task_id}")
-                response.raise_for_status()
-                return f"Task '{task_id}' has been cancelled successfully."
+            await self._request_json(
+                "POST",
+                f"/api/v1/workflows/cancel/{task_id}",
+                timeout=15.0,
+            )
+            return f"Task '{task_id}' has been cancelled successfully."
         except httpx.ConnectError:
             return "Error: Cannot connect to DeepCode backend. Is the DeepCode service running?"
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 400:
                 return f"Error: Task '{task_id}' not found or cannot be cancelled."
-            return (
-                f"Error: DeepCode API returned status {e.response.status_code}: {e.response.text}"
-            )
+            return _format_http_status_error(e)
         except Exception as e:
             return f"Error cancelling task: {str(e)}"
 
 
-class DeepCodeRespondTool(Tool):
+class DeepCodeRespondTool(_DeepCodeToolBase):
     """Respond to a DeepCode User-in-Loop interaction request."""
 
     def __init__(self, api_url: str | None = None):
-        self._api_url = api_url or _get_deepcode_url()
+        super().__init__(api_url=api_url)
 
     @property
     def name(self) -> str:
@@ -439,32 +542,28 @@ class DeepCodeRespondTool(Tool):
         **kwargs: Any,
     ) -> str:
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    f"{self._api_url}/api/v1/workflows/respond/{task_id}",
-                    json={
-                        "action": action,
-                        "data": data or {},
-                        "skipped": skipped,
-                    },
-                )
-                response.raise_for_status()
-                response.json()  # validate JSON response
-                return (
-                    f"Response submitted successfully!\n"
-                    f"Task ID: {task_id}\n"
-                    f"Action: {action}\n"
-                    f"The workflow will now continue."
-                )
+            await self._request_json(
+                "POST",
+                f"/api/v1/workflows/respond/{task_id}",
+                json={
+                    "action": action,
+                    "data": data or {},
+                    "skipped": skipped,
+                },
+            )
+            return (
+                f"Response submitted successfully!\n"
+                f"Task ID: {task_id}\n"
+                f"Action: {action}\n"
+                f"The workflow will now continue."
+            )
         except httpx.ConnectError:
             return "Error: Cannot connect to DeepCode backend. Is the DeepCode service running?"
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 400:
-                detail = e.response.json().get("detail", "Unknown error")
-                return f"Error: {detail}"
-            return (
-                f"Error: DeepCode API returned status {e.response.status_code}: {e.response.text}"
-            )
+                detail = _try_get_error_detail(e.response)
+                return f"Error: {detail or 'Unknown error'}"
+            return _format_http_status_error(e)
         except Exception as e:
             return f"Error responding to interaction: {str(e)}"
 

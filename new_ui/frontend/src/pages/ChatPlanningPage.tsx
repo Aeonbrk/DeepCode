@@ -1,18 +1,19 @@
 import { useState, useEffect, useRef } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { m } from 'framer-motion';
 import { Card } from '../components/common';
 import { ChatInput } from '../components/input';
 import { ProgressTracker, ActivityLogViewer } from '../components/streaming';
-import { FileTree } from '../components/results';
-import { InlineChatInteraction } from '../components/interaction';
+import { FileTree, WorkflowOutcomeCard } from '../components/results';
+import ChatTranscript from '../components/chat/ChatTranscript';
 import { useWorkflowStore } from '../stores/workflowStore';
 import { useSessionStore } from '../stores/sessionStore';
 import { useStreaming } from '../hooks/useStreaming';
 import { workflowsApi } from '../services/api';
 import { toast } from '../components/common/Toaster';
 import { CHAT_PLANNING_STEPS } from '../types/workflow';
-import { MessageSquare, User, Bot, CheckCircle, XCircle, FolderOpen, StopCircle } from 'lucide-react';
+import { MessageSquare, StopCircle } from 'lucide-react';
 import { ConfirmDialog } from '../components/common/ConfirmDialog';
+import { shallow } from 'zustand/shallow';
 
 export default function ChatPlanningPage() {
   const [enableIndexing, setEnableIndexing] = useState(false);
@@ -36,13 +37,40 @@ export default function ChatPlanningPage() {
     setSteps,
     setStatus,
     reset,
-  } = useWorkflowStore();
+  } = useWorkflowStore(
+    (s) => ({
+      activeTaskId: s.activeTaskId,
+      status: s.status,
+      progress: s.progress,
+      message: s.message,
+      steps: s.steps,
+      generatedFiles: s.generatedFiles,
+      activityLogs: s.activityLogs,
+      pendingInteraction: s.pendingInteraction,
+      isWaitingForInput: s.isWaitingForInput,
+      result: s.result,
+      error: s.error,
+      setActiveTask: s.setActiveTask,
+      setSteps: s.setSteps,
+      setStatus: s.setStatus,
+      reset: s.reset,
+    }),
+    shallow
+  );
 
-  const { conversationHistory, addMessage } = useSessionStore();
+  const { conversationHistory, addMessage } = useSessionStore(
+    (s) => ({
+      conversationHistory: s.conversationHistory,
+      addMessage: s.addMessage,
+    }),
+    shallow
+  );
   useStreaming(activeTaskId);
 
   // Debug: log status changes
-  console.log('[ChatPlanningPage] status:', status, 'result:', result, 'error:', error);
+  if (import.meta.env.DEV) {
+    console.log('[ChatPlanningPage] status:', status, 'result:', result, 'error:', error);
+  }
 
   // Auto-scroll to bottom when new messages or interactions appear
   useEffect(() => {
@@ -129,11 +157,18 @@ export default function ChatPlanningPage() {
   };
 
   const isRunning = status === 'running';
+  const codeDirectory =
+    result?.repo_result &&
+    typeof result.repo_result === 'object' &&
+    result.repo_result !== null &&
+    'code_directory' in (result.repo_result as Record<string, unknown>)
+      ? String((result.repo_result as Record<string, unknown>).code_directory)
+      : null;
 
   return (
     <div className="space-y-6">
       {/* Header */}
-      <motion.div
+      <m.div
         initial={{ opacity: 0, y: -10 }}
         animate={{ opacity: 1, y: 0 }}
       >
@@ -141,7 +176,7 @@ export default function ChatPlanningPage() {
         <p className="text-gray-500 mt-1">
           Describe your project and let AI generate the code for you
         </p>
-      </motion.div>
+      </m.div>
 
       <div className="grid gap-6 lg:grid-cols-2">
         {/* Left Column - Chat */}
@@ -158,64 +193,12 @@ export default function ChatPlanningPage() {
             </div>
 
             {/* Chat Messages */}
-            <div ref={chatContainerRef} className="flex-1 overflow-y-auto p-4 space-y-4">
-              {conversationHistory.length === 0 && !pendingInteraction ? (
-                <div className="h-full flex items-center justify-center text-center text-gray-400">
-                  <div>
-                    <MessageSquare className="h-12 w-12 mx-auto mb-3 opacity-50" />
-                    <p className="text-sm">
-                      Describe your project requirements to get started
-                    </p>
-                  </div>
-                </div>
-              ) : (
-                <>
-                  {conversationHistory.map((msg) => (
-                    <motion.div
-                      key={msg.id}
-                      initial={{ opacity: 0, y: 10 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      className={`flex items-start space-x-3 ${
-                        msg.role === 'user' ? 'flex-row-reverse space-x-reverse' : ''
-                      }`}
-                    >
-                      <div
-                        className={`flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center ${
-                          msg.role === 'user'
-                            ? 'bg-primary-100'
-                            : 'bg-gray-100'
-                        }`}
-                      >
-                        {msg.role === 'user' ? (
-                          <User className="h-4 w-4 text-primary-600" />
-                        ) : (
-                          <Bot className="h-4 w-4 text-gray-600" />
-                        )}
-                      </div>
-                      <div
-                        className={`max-w-[80%] px-4 py-2 rounded-2xl ${
-                          msg.role === 'user'
-                            ? 'bg-primary-500 text-white'
-                            : 'bg-gray-100 text-gray-900'
-                        }`}
-                      >
-                        <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
-                      </div>
-                    </motion.div>
-                  ))}
-
-                  {/* Inline Interaction - displayed in chat flow */}
-                  <AnimatePresence>
-                    {pendingInteraction && activeTaskId && (
-                      <InlineChatInteraction
-                        taskId={activeTaskId}
-                        interaction={pendingInteraction}
-                      />
-                    )}
-                  </AnimatePresence>
-                </>
-              )}
-            </div>
+            <ChatTranscript
+              containerRef={chatContainerRef}
+              conversationHistory={conversationHistory}
+              pendingInteraction={pendingInteraction}
+              activeTaskId={activeTaskId}
+            />
 
             {/* Chat Input */}
             <div className="p-4 border-t border-gray-100">
@@ -279,54 +262,21 @@ export default function ChatPlanningPage() {
 
           {/* Completion Status */}
           {status === 'completed' && result && (
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-            >
-              <Card className="border-green-200 bg-green-50">
-                <div className="flex items-start space-x-3">
-                  <CheckCircle className="h-6 w-6 text-green-500 flex-shrink-0" />
-                  <div className="flex-1">
-                    <h3 className="font-medium text-green-900">
-                      Code Generation Complete!
-                    </h3>
-                    <p className="text-sm text-green-700 mt-1">
-                      Your code has been successfully generated.
-                    </p>
-                    {result.repo_result && typeof result.repo_result === 'object' && 'code_directory' in (result.repo_result as Record<string, unknown>) ? (
-                      <div className="mt-3 flex items-center text-sm text-green-600">
-                        <FolderOpen className="h-4 w-4 mr-2" />
-                        <span className="font-mono text-xs">
-                          {String((result.repo_result as Record<string, unknown>).code_directory)}
-                        </span>
-                      </div>
-                    ) : null}
-                  </div>
-                </div>
-              </Card>
-            </motion.div>
+            <WorkflowOutcomeCard
+              variant="success"
+              title="Code Generation Complete!"
+              message="Your code has been successfully generated."
+              codeDirectory={codeDirectory}
+            />
           )}
 
           {/* Error Status */}
           {status === 'error' && error && (
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-            >
-              <Card className="border-red-200 bg-red-50">
-                <div className="flex items-start space-x-3">
-                  <XCircle className="h-6 w-6 text-red-500 flex-shrink-0" />
-                  <div className="flex-1">
-                    <h3 className="font-medium text-red-900">
-                      Generation Failed
-                    </h3>
-                    <p className="text-sm text-red-700 mt-1">
-                      {error}
-                    </p>
-                  </div>
-                </div>
-              </Card>
-            </motion.div>
+            <WorkflowOutcomeCard
+              variant="error"
+              title="Generation Failed"
+              message={error}
+            />
           )}
         </div>
       </div>

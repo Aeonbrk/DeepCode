@@ -15,6 +15,8 @@ export function useWebSocket(
   url: string | null,
   options: UseWebSocketOptions = {}
 ) {
+  const debugPayloads = import.meta.env.VITE_DEBUG_WS_PAYLOADS === '1';
+
   const {
     onMessage,
     onOpen,
@@ -27,7 +29,7 @@ export function useWebSocket(
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectAttemptsRef = useRef(0);
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const shouldReconnectRef = useRef(true);
 
   // Use refs for callbacks to avoid triggering reconnection on callback changes
@@ -45,7 +47,6 @@ export function useWebSocket(
   }, [onMessage, onOpen, onClose, onError]);
 
   const [isConnected, setIsConnected] = useState(false);
-  const [lastMessage, setLastMessage] = useState<WSMessage | null>(null);
 
   const connect = useCallback(() => {
     if (!url) return;
@@ -93,16 +94,24 @@ export function useWebSocket(
     ws.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data) as WSMessage;
-        console.log('[useWebSocket] Received:', message.type, message);
-        setLastMessage(message);
+        if (import.meta.env.DEV) {
+          if (debugPayloads) {
+            console.log('[useWebSocket] Received:', message.type, message);
+          } else {
+            console.log('[useWebSocket] Received:', message.type);
+          }
+        }
         if (onMessageRef.current) {
-          console.log('[useWebSocket] Calling onMessage handler');
           onMessageRef.current(message);
-        } else {
-          console.error('[useWebSocket] No onMessage handler registered!');
+        } else if (import.meta.env.DEV) {
+          console.warn('[useWebSocket] No onMessage handler registered!');
         }
       } catch (e) {
-        console.error('Failed to parse WebSocket message:', event.data, e);
+        if (import.meta.env.DEV && debugPayloads) {
+          console.error('Failed to parse WebSocket message:', event.data, e);
+        } else {
+          console.error('Failed to parse WebSocket message:', e);
+        }
       }
     };
 
@@ -140,7 +149,6 @@ export function useWebSocket(
 
   return {
     isConnected,
-    lastMessage,
     sendMessage,
     connect,
     disconnect,

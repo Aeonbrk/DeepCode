@@ -91,7 +91,10 @@ class CodeImplementationWorkflow:
     def _check_file_tree_exists(self, target_directory: str) -> bool:
         """Check if file tree structure already exists"""
         code_directory = os.path.join(target_directory, "generate_code")
-        return os.path.exists(code_directory) and len(os.listdir(code_directory)) > 0
+        if not os.path.isdir(code_directory):
+            return False
+        with os.scandir(code_directory) as entries:
+            return next(entries, None) is not None
 
     # ==================== 2. Public Interface Methods (External API Layer) ====================
 

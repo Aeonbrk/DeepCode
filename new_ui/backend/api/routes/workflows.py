@@ -5,6 +5,7 @@ Handles paper-to-code and chat-based planning workflows
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 
+from app_utils.redaction import redact_payload, redact_text
 from services.workflow_service import workflow_service
 from models.requests import (
     PaperToCodeRequest,
@@ -82,16 +83,16 @@ async def get_workflow_status(task_id: str):
         "task_id": task.task_id,
         "status": task.status,
         "progress": task.progress,
-        "message": task.message,
-        "result": task.result,
-        "error": task.error,
+        "message": redact_text(task.message),
+        "result": redact_payload(task.result),
+        "error": redact_text(task.error),
         "started_at": task.started_at.isoformat() if task.started_at else None,
         "completed_at": task.completed_at.isoformat() if task.completed_at else None,
     }
 
     # Include pending interaction if waiting for input
     if task.status == "waiting_for_input" and task.pending_interaction:
-        response["pending_interaction"] = task.pending_interaction
+        response["pending_interaction"] = redact_payload(task.pending_interaction)
 
     return response
 
@@ -178,7 +179,7 @@ async def get_pending_interaction(task_id: str):
         "has_interaction": True,
         "task_id": task_id,
         "status": task.status,
-        "interaction": task.pending_interaction,
+        "interaction": redact_payload(task.pending_interaction),
     }
 
 
@@ -195,7 +196,7 @@ async def get_active_tasks():
                 "task_id": task.task_id,
                 "status": task.status,
                 "progress": task.progress,
-                "message": task.message,
+                "message": redact_text(task.message),
                 "started_at": task.started_at,
             }
             for task in active_tasks
@@ -216,9 +217,9 @@ async def get_recent_tasks(limit: int = 10):
                 "task_id": task.task_id,
                 "status": task.status,
                 "progress": task.progress,
-                "message": task.message,
-                "result": task.result,
-                "error": task.error,
+                "message": redact_text(task.message),
+                "result": redact_payload(task.result),
+                "error": redact_text(task.error),
                 "started_at": task.started_at,
                 "completed_at": task.completed_at,
             }

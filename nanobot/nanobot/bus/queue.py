@@ -7,6 +7,9 @@ from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 
+DEFAULT_INBOUND_MAXSIZE = 1000
+DEFAULT_OUTBOUND_MAXSIZE = 1000
+
 
 class MessageBus:
     """
@@ -16,9 +19,16 @@ class MessageBus:
     them and pushes responses to the outbound queue.
     """
 
-    def __init__(self):
-        self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
-        self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
+    def __init__(
+        self,
+        *,
+        inbound_maxsize: int = DEFAULT_INBOUND_MAXSIZE,
+        outbound_maxsize: int = DEFAULT_OUTBOUND_MAXSIZE,
+    ):
+        # Bounded queues prevent unbounded memory growth if a consumer stalls.
+        # Use maxsize=0 for unbounded.
+        self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue(maxsize=inbound_maxsize)
+        self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue(maxsize=outbound_maxsize)
         self._outbound_subscribers: dict[
             str, list[Callable[[OutboundMessage], Awaitable[None]]]
         ] = {}

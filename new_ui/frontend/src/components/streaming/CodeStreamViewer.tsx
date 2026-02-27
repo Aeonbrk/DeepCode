@@ -1,9 +1,13 @@
-import { useEffect, useRef } from 'react';
-import Editor from '@monaco-editor/react';
-import { motion } from 'framer-motion';
+import { Suspense, lazy, useEffect, useRef, useState } from 'react';
+import { m } from 'framer-motion';
 import { Code, Copy, Check, Loader2 } from 'lucide-react';
-import { useState } from 'react';
-import type { editor } from 'monaco-editor';
+
+const MonacoEditor = lazy(() => import('@monaco-editor/react'));
+
+type StandaloneCodeEditor = {
+  getModel: () => { getLineCount: () => number } | null;
+  revealLine: (lineNumber: number) => void;
+};
 
 interface CodeStreamViewerProps {
   code: string;
@@ -19,7 +23,7 @@ export default function CodeStreamViewer({
   language = 'python',
 }: CodeStreamViewerProps) {
   const [copied, setCopied] = useState(false);
-  const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
+  const editorRef = useRef<StandaloneCodeEditor | null>(null);
 
   // Auto-scroll to bottom when code updates
   useEffect(() => {
@@ -70,14 +74,14 @@ export default function CodeStreamViewer({
             {currentFile || 'Generated Code'}
           </span>
           {isStreaming && (
-            <motion.span
+            <m.span
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               className="flex items-center text-xs text-primary-600"
             >
               <Loader2 className="h-3 w-3 mr-1 animate-spin" />
               Generating...
-            </motion.span>
+            </m.span>
           )}
         </div>
 
@@ -110,35 +114,46 @@ export default function CodeStreamViewer({
             </div>
           </div>
         ) : (
-          <Editor
-            height="400px"
-            language={detectLanguage(currentFile)}
-            value={code}
-            theme="vs-light"
-            onMount={(editor) => {
-              editorRef.current = editor;
-            }}
-            options={{
-              readOnly: true,
-              minimap: { enabled: false },
-              scrollBeyondLastLine: false,
-              fontSize: 13,
-              fontFamily: "'JetBrains Mono', Menlo, Monaco, monospace",
-              lineNumbers: 'on',
-              renderLineHighlight: 'none',
-              scrollbar: {
-                vertical: 'auto',
-                horizontal: 'auto',
-              },
-              padding: { top: 16, bottom: 16 },
-            }}
-          />
+          <Suspense
+            fallback={
+              <div className="h-[400px] flex items-center justify-center text-gray-400">
+                <div className="text-center">
+                  <Loader2 className="h-6 w-6 mx-auto mb-2 animate-spin opacity-50" />
+                  <p className="text-sm">Loading editor...</p>
+                </div>
+              </div>
+            }
+          >
+            <MonacoEditor
+              height="400px"
+              language={detectLanguage(currentFile)}
+              value={code}
+              theme="vs-light"
+              onMount={(editor) => {
+                editorRef.current = editor;
+              }}
+              options={{
+                readOnly: true,
+                minimap: { enabled: false },
+                scrollBeyondLastLine: false,
+                fontSize: 13,
+                fontFamily: "'JetBrains Mono', Menlo, Monaco, monospace",
+                lineNumbers: 'on',
+                renderLineHighlight: 'none',
+                scrollbar: {
+                  vertical: 'auto',
+                  horizontal: 'auto',
+                },
+                padding: { top: 16, bottom: 16 },
+              }}
+            />
+          </Suspense>
         )}
 
         {/* Streaming indicator overlay */}
         {isStreaming && (
           <div className="absolute bottom-4 right-4">
-            <motion.div
+            <m.div
               initial={{ opacity: 0, scale: 0.9 }}
               animate={{ opacity: 1, scale: 1 }}
               className="flex items-center space-x-2 px-3 py-1.5 bg-primary-50 border border-primary-200 rounded-full"
@@ -150,7 +165,7 @@ export default function CodeStreamViewer({
               <span className="text-xs font-medium text-primary-700">
                 Live
               </span>
-            </motion.div>
+            </m.div>
           </div>
         )}
       </div>

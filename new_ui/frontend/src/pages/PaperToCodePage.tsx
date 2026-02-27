@@ -1,26 +1,30 @@
 import { useState, useEffect } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { AnimatePresence, m } from 'framer-motion';
 import { Card, Button } from '../components/common';
 import { FileUploader, UrlInput } from '../components/input';
 import { ProgressTracker, ActivityLogViewer } from '../components/streaming';
-import { FileTree } from '../components/results';
+import { FileTree, WorkflowOutcomeCard } from '../components/results';
 import { InteractionPanel } from '../components/interaction';
 import { useWorkflowStore } from '../stores/workflowStore';
 import { useStreaming } from '../hooks/useStreaming';
 import { workflowsApi } from '../services/api';
 import { toast } from '../components/common/Toaster';
 import { PAPER_TO_CODE_STEPS } from '../types/workflow';
-import { CheckCircle, XCircle, FolderOpen, StopCircle } from 'lucide-react';
+import { StopCircle } from 'lucide-react';
 import { ConfirmDialog } from '../components/common/ConfirmDialog';
+import { shallow } from 'zustand/shallow';
 
 type InputMethod = 'file' | 'url';
 
 export default function PaperToCodePage() {
-  const [inputMethod, setInputMethod] = useState<InputMethod>('file');
-  const [uploadedFilePath, setUploadedFilePath] = useState<string | null>(null);
-  const [enableIndexing, setEnableIndexing] = useState(false);
-  const [showCancelDialog, setShowCancelDialog] = useState(false);
-  const [isCancelling, setIsCancelling] = useState(false);
+  const [local, setLocal] = useState({
+    inputMethod: 'file' as InputMethod,
+    uploadedFilePath: null as string | null,
+    enableIndexing: false,
+    showCancelDialog: false,
+    isCancelling: false,
+  });
+  const { inputMethod, uploadedFilePath, enableIndexing, showCancelDialog, isCancelling } = local;
 
   const {
     activeTaskId,
@@ -38,7 +42,26 @@ export default function PaperToCodePage() {
     setSteps,
     setStatus,
     reset,
-  } = useWorkflowStore();
+  } = useWorkflowStore(
+    (s) => ({
+      activeTaskId: s.activeTaskId,
+      status: s.status,
+      progress: s.progress,
+      message: s.message,
+      steps: s.steps,
+      generatedFiles: s.generatedFiles,
+      activityLogs: s.activityLogs,
+      pendingInteraction: s.pendingInteraction,
+      isWaitingForInput: s.isWaitingForInput,
+      result: s.result,
+      error: s.error,
+      setActiveTask: s.setActiveTask,
+      setSteps: s.setSteps,
+      setStatus: s.setStatus,
+      reset: s.reset,
+    }),
+    shallow
+  );
 
   useStreaming(activeTaskId);
 
@@ -55,7 +78,7 @@ export default function PaperToCodePage() {
   const handleCancelTask = async () => {
     if (!activeTaskId) return;
 
-    setIsCancelling(true);
+    setLocal((s) => ({ ...s, isCancelling: true }));
     try {
       await workflowsApi.cancel(activeTaskId);
       setStatus('idle');
@@ -65,8 +88,7 @@ export default function PaperToCodePage() {
       toast.error('Cancel failed', 'Could not cancel the task.');
       console.error('Cancel error:', err);
     } finally {
-      setIsCancelling(false);
-      setShowCancelDialog(false);
+      setLocal((s) => ({ ...s, isCancelling: false, showCancelDialog: false }));
     }
   };
 
@@ -90,7 +112,7 @@ export default function PaperToCodePage() {
   };
 
   const handleFileUploaded = (_fileId: string, path: string) => {
-    setUploadedFilePath(path);
+    setLocal((s) => ({ ...s, uploadedFilePath: path }));
   };
 
   const handleUrlSubmit = (url: string) => {
@@ -104,11 +126,18 @@ export default function PaperToCodePage() {
   };
 
   const isRunning = status === 'running';
+  const codeDirectory =
+    result?.repo_result &&
+    typeof result.repo_result === 'object' &&
+    result.repo_result !== null &&
+    'code_directory' in (result.repo_result as Record<string, unknown>)
+      ? String((result.repo_result as Record<string, unknown>).code_directory)
+      : null;
 
   return (
     <div className="space-y-6">
       {/* Header */}
-      <motion.div
+      <m.div
         initial={{ opacity: 0, y: -10 }}
         animate={{ opacity: 1, y: 0 }}
       >
@@ -116,7 +145,7 @@ export default function PaperToCodePage() {
         <p className="text-gray-500 mt-1">
           Upload a research paper and convert it to a working implementation
         </p>
-      </motion.div>
+      </m.div>
 
       <div className="grid gap-6 lg:grid-cols-2">
         {/* Left Column - Input */}
@@ -127,7 +156,7 @@ export default function PaperToCodePage() {
             {/* Input Method Tabs */}
             <div className="flex space-x-2 mb-4">
               <button
-                onClick={() => setInputMethod('file')}
+                onClick={() => setLocal((s) => ({ ...s, inputMethod: 'file' }))}
                 className={`flex-1 px-4 py-2 text-sm font-medium rounded-lg transition-colors ${
                   inputMethod === 'file'
                     ? 'bg-primary-50 text-primary-600'
@@ -137,7 +166,7 @@ export default function PaperToCodePage() {
                 Upload PDF
               </button>
               <button
-                onClick={() => setInputMethod('url')}
+                onClick={() => setLocal((s) => ({ ...s, inputMethod: 'url' }))}
                 className={`flex-1 px-4 py-2 text-sm font-medium rounded-lg transition-colors ${
                   inputMethod === 'url'
                     ? 'bg-primary-50 text-primary-600'
@@ -170,7 +199,7 @@ export default function PaperToCodePage() {
             {isRunning && (
               <div className="mt-4">
                 <button
-                  onClick={() => setShowCancelDialog(true)}
+                  onClick={() => setLocal((s) => ({ ...s, showCancelDialog: true }))}
                   disabled={isCancelling}
                   className="w-full flex items-center justify-center space-x-2 px-4 py-2 text-sm font-medium text-red-600 bg-red-50 border border-red-200 rounded-lg hover:bg-red-100 transition-colors disabled:opacity-50"
                 >
@@ -186,7 +215,7 @@ export default function PaperToCodePage() {
                 <input
                   type="checkbox"
                   checked={enableIndexing}
-                  onChange={(e) => setEnableIndexing(e.target.checked)}
+                  onChange={(e) => setLocal((s) => ({ ...s, enableIndexing: e.target.checked }))}
                   className="w-4 h-4 text-primary-600 rounded focus:ring-primary-500"
                 />
                 <span className="text-sm text-gray-700">
@@ -233,54 +262,21 @@ export default function PaperToCodePage() {
 
           {/* Completion Status */}
           {status === 'completed' && result && (
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-            >
-              <Card className="border-green-200 bg-green-50">
-                <div className="flex items-start space-x-3">
-                  <CheckCircle className="h-6 w-6 text-green-500 flex-shrink-0" />
-                  <div className="flex-1">
-                    <h3 className="font-medium text-green-900">
-                      Code Generation Complete!
-                    </h3>
-                    <p className="text-sm text-green-700 mt-1">
-                      Your code has been successfully generated from the paper.
-                    </p>
-                    {result.repo_result && typeof result.repo_result === 'object' && 'code_directory' in (result.repo_result as Record<string, unknown>) ? (
-                      <div className="mt-3 flex items-center text-sm text-green-600">
-                        <FolderOpen className="h-4 w-4 mr-2" />
-                        <span className="font-mono text-xs">
-                          {String((result.repo_result as Record<string, unknown>).code_directory)}
-                        </span>
-                      </div>
-                    ) : null}
-                  </div>
-                </div>
-              </Card>
-            </motion.div>
+            <WorkflowOutcomeCard
+              variant="success"
+              title="Code Generation Complete!"
+              message="Your code has been successfully generated from the paper."
+              codeDirectory={codeDirectory}
+            />
           )}
 
           {/* Error Status */}
           {status === 'error' && error && (
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-            >
-              <Card className="border-red-200 bg-red-50">
-                <div className="flex items-start space-x-3">
-                  <XCircle className="h-6 w-6 text-red-500 flex-shrink-0" />
-                  <div className="flex-1">
-                    <h3 className="font-medium text-red-900">
-                      Processing Failed
-                    </h3>
-                    <p className="text-sm text-red-700 mt-1">
-                      {error}
-                    </p>
-                  </div>
-                </div>
-              </Card>
-            </motion.div>
+            <WorkflowOutcomeCard
+              variant="error"
+              title="Processing Failed"
+              message={error}
+            />
           )}
         </div>
       </div>
@@ -294,7 +290,7 @@ export default function PaperToCodePage() {
         cancelLabel="Keep Running"
         variant="danger"
         onConfirm={handleCancelTask}
-        onCancel={() => setShowCancelDialog(false)}
+        onCancel={() => setLocal((s) => ({ ...s, showCancelDialog: false }))}
       />
     </div>
   );

@@ -6,6 +6,9 @@ Command Executor MCP Tool / 命令执行器 MCP 工具
 Specialized in executing LLM-generated shell commands to create file tree structures
 """
 
+import asyncio
+import os
+import re
 import subprocess
 from pathlib import Path
 from typing import List, Dict
@@ -16,6 +19,48 @@ import mcp.server.stdio
 
 # 创建MCP服务器实例 / Create MCP server instance
 app = Server("command-executor")
+
+_MAX_OUTPUT_CHARS = int(os.environ.get("DEEPCODE_SHELL_MAX_OUTPUT_CHARS", "20000"))
+_REDACTION_RULES: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"(?i)\bAuthorization:\s*Bearer\s+[^\s]+"), "Authorization: Bearer ***"),
+    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9\-_\.=:+/]{10,}"), "Bearer ***"),
+    (re.compile(r"\bsk-proj-[A-Za-z0-9]{10,}\b"), "sk-proj-***"),
+    (re.compile(r"\bsk-[A-Za-z0-9]{10,}\b"), "sk-***"),
+    (re.compile(r"\bsk-ant-[A-Za-z0-9\-_]{10,}\b"), "sk-ant-***"),
+    (re.compile(r"\bAIza[0-9A-Za-z\-_]{10,}\b"), "AIza***"),
+    (
+        re.compile(
+            r"(?i)\b([A-Z0-9_]*(?:API_KEY|ACCESS_KEY|SECRET_KEY|TOKEN|PASSWORD)[A-Z0-9_]*)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s]+)"
+        ),
+        r"\1=***",
+    ),
+    (
+        re.compile(
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+            re.DOTALL,
+        ),
+        "-----BEGIN PRIVATE KEY-----***-----END PRIVATE KEY-----",
+    ),
+]
+
+
+def _redact_text(value: str) -> str:
+    redacted = value
+    for pattern, replacement in _REDACTION_RULES:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def _truncate_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit].rstrip() + "\n... (truncated)\n"
+
+
+def _sanitize_output(value: str) -> str:
+    if not value:
+        return ""
+    return _truncate_text(_redact_text(value), _MAX_OUTPUT_CHARS)
 
 
 @app.list_tools()
@@ -108,7 +153,7 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
         return [
             types.TextContent(
                 type="text",
-                text=f"工具执行错误 / Error executing tool {name}: {str(e)}",
+                text=f"工具执行错误 / Error executing tool {name}: {_sanitize_output(str(e))}",
             )
         ]
 
@@ -147,8 +192,10 @@ async def execute_command_batch(
 
         for i, command in enumerate(command_lines, 1):
             try:
+                display_command = _redact_text(command)
                 # 执行命令 / Execute command
-                result = subprocess.run(
+                result = await asyncio.to_thread(
+                    subprocess.run,
                     command,
                     shell=True,
                     cwd=working_directory,
@@ -158,21 +205,27 @@ async def execute_command_batch(
                 )
 
                 if result.returncode == 0:
-                    results.append(f"✅ Command {i}: {command}")
+                    results.append(f"✅ Command {i}: {display_command}")
                     if result.stdout.strip():
-                        results.append(f"   输出 / Output: {result.stdout.strip()}")
+                        results.append(
+                            f"   输出 / Output: {_sanitize_output(result.stdout.strip())}"
+                        )
                     stats["successful"] += 1
                 else:
-                    results.append(f"❌ Command {i}: {command}")
+                    results.append(f"❌ Command {i}: {display_command}")
                     if result.stderr.strip():
-                        results.append(f"   错误 / Error: {result.stderr.strip()}")
+                        results.append(
+                            f"   错误 / Error: {_sanitize_output(result.stderr.strip())}"
+                        )
                     stats["failed"] += 1
 
             except subprocess.TimeoutExpired:
-                results.append(f"⏱️ Command {i} 超时 / timeout: {command}")
+                results.append(f"⏱️ Command {i} 超时 / timeout: {display_command}")
                 stats["timeout"] += 1
             except Exception as e:
-                results.append(f"💥 Command {i} 异常 / exception: {command} - {str(e)}")
+                results.append(
+                    f"💥 Command {i} 异常 / exception: {display_command} - {_sanitize_output(str(e))}"
+                )
                 stats["failed"] += 1
 
         # 生成执行报告 / Generate execution report
@@ -185,7 +238,7 @@ async def execute_command_batch(
         return [
             types.TextContent(
                 type="text",
-                text=f"批量命令执行失败 / Failed to execute command batch: {str(e)}",
+                text=f"批量命令执行失败 / Failed to execute command batch: {_sanitize_output(str(e))}",
             )
         ]
 
@@ -208,7 +261,8 @@ async def execute_single_command(
         Path(working_directory).mkdir(parents=True, exist_ok=True)
 
         # 执行命令 / Execute command
-        result = subprocess.run(
+        result = await asyncio.to_thread(
+            subprocess.run,
             command,
             shell=True,
             cwd=working_directory,
@@ -225,13 +279,15 @@ async def execute_single_command(
     except subprocess.TimeoutExpired:
         return [
             types.TextContent(
-                type="text", text=f"⏱️ 命令超时 / Command timeout: {command}"
+                type="text",
+                text=f"⏱️ 命令超时 / Command timeout: {_redact_text(command)}",
             )
         ]
     except Exception as e:
         return [
             types.TextContent(
-                type="text", text=f"💥 命令执行错误 / Command execution error: {str(e)}"
+                type="text",
+                text=f"💥 命令执行错误 / Command execution error: {_sanitize_output(str(e))}",
             )
         ]
 
@@ -277,11 +333,12 @@ def format_single_command_result(
     Returns:
         格式化的结果 / Formatted result
     """
+    display_command = _redact_text(command)
     output = f"""
 单命令执行 / Single Command Execution:
 {'='*40}
 工作目录 / Working Directory: {working_directory}
-命令 / Command: {command}
+命令 / Command: {display_command}
 返回码 / Return Code: {result.returncode}
 
 """
@@ -289,11 +346,11 @@ def format_single_command_result(
     if result.returncode == 0:
         output += "✅ 状态 / Status: SUCCESS / 成功\n"
         if result.stdout.strip():
-            output += f"输出 / Output:\n{result.stdout.strip()}\n"
+            output += f"输出 / Output:\n{_sanitize_output(result.stdout.strip())}\n"
     else:
         output += "❌ 状态 / Status: FAILED / 失败\n"
         if result.stderr.strip():
-            output += f"错误 / Error:\n{result.stderr.strip()}\n"
+            output += f"错误 / Error:\n{_sanitize_output(result.stderr.strip())}\n"
 
     return output
 

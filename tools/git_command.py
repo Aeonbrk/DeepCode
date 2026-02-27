@@ -6,7 +6,7 @@ GitHub Repository Downloader MCP Tool using FastMCP
 import asyncio
 import os
 import re
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 
 from mcp.server import FastMCP
@@ -63,8 +63,9 @@ class GitHubURLExtractor:
                     else:
                         continue
 
-                # 规范化 URL
-                url = url.rstrip(".git")
+                # Normalize URL (.git suffix only, not rstrip(".git") which removes characters)
+                if url.lower().endswith(".git"):
+                    url = url[:-4]
                 url = url.rstrip("/")
 
                 # 修复重复的 github.com
@@ -107,7 +108,8 @@ class GitHubURLExtractor:
     @staticmethod
     def infer_repo_name(url: str) -> str:
         """从URL推断仓库名称"""
-        url = url.rstrip(".git")
+        if url.lower().endswith(".git"):
+            url = url[:-4]
         if "github.com" in url:
             parts = url.split("/")
             if len(parts) >= 2:
@@ -130,7 +132,7 @@ async def check_git_installed() -> bool:
         return False
 
 
-async def clone_repository(repo_url: str, target_path: str) -> Dict[str, any]:
+async def clone_repository(repo_url: str, target_path: str) -> Dict[str, Any]:
     """执行git clone命令"""
     try:
         proc = await asyncio.create_subprocess_exec(

@@ -5,9 +5,56 @@ This module provides common LLM-related utilities to avoid circular imports
 and reduce code duplication across the project.
 """
 
+import copy
 import os
 import yaml
 from typing import Any, Type, Dict, Tuple
+
+_YAML_FILE_CACHE: Dict[str, Tuple[int, int, int, int, Any]] = {}
+
+
+def _read_yaml_file(file_path: str) -> Any:
+    with open(file_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _should_skip_yaml_cache(abs_path: str) -> bool:
+    """Avoid caching sensitive secrets files in process memory."""
+    filename = os.path.basename(abs_path).lower()
+    return "secrets" in filename
+
+
+def _load_yaml_file_cached(file_path: str) -> Any:
+    """Load YAML using an mtime-aware cache and return a defensive copy."""
+    abs_path = os.path.abspath(file_path)
+    if _should_skip_yaml_cache(abs_path):
+        return _read_yaml_file(abs_path)
+
+    stat_result = os.stat(abs_path)
+    inode = getattr(stat_result, "st_ino", 0)
+    mtime_ns = getattr(
+        stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000)
+    )
+    ctime_ns = getattr(
+        stat_result, "st_ctime_ns", int(stat_result.st_ctime * 1_000_000_000)
+    )
+    cache_key = abs_path
+    file_size = stat_result.st_size
+
+    cached = _YAML_FILE_CACHE.get(cache_key)
+    if (
+        cached
+        and cached[0] == inode
+        and cached[1] == mtime_ns
+        and cached[2] == ctime_ns
+        and cached[3] == file_size
+    ):
+        return copy.deepcopy(cached[4])
+
+    loaded = _read_yaml_file(abs_path)
+
+    _YAML_FILE_CACHE[cache_key] = (inode, mtime_ns, ctime_ns, file_size, loaded)
+    return copy.deepcopy(loaded)
 
 
 def get_api_keys(secrets_path: str = "mcp_agent.secrets.yaml") -> Dict[str, str]:
@@ -30,8 +77,7 @@ def get_api_keys(secrets_path: str = "mcp_agent.secrets.yaml") -> Dict[str, str]
     """
     secrets = {}
     if os.path.exists(secrets_path):
-        with open(secrets_path, "r", encoding="utf-8") as f:
-            secrets = yaml.safe_load(f) or {}
+        secrets = _load_yaml_file_cached(secrets_path) or {}
 
     # Config file takes priority, env vars are fallback only
     return {
@@ -72,8 +118,7 @@ def load_api_config(secrets_path: str = "mcp_agent.secrets.yaml") -> Dict[str, A
     # Load base config from YAML
     config = {}
     if os.path.exists(secrets_path):
-        with open(secrets_path, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
+        config = _load_yaml_file_cached(secrets_path) or {}
 
     # Get keys with env var override
     keys = get_api_keys(secrets_path)
@@ -206,8 +251,7 @@ def get_token_limits(config_path: str = "mcp_agent.config.yaml") -> Tuple[int, i
 
     try:
         if os.path.exists(config_path):
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = yaml.safe_load(f)
+            config = _load_yaml_file_cached(config_path)
 
             openai_config = config.get("openai", {})
             base_tokens = openai_config.get("base_max_tokens", default_base)
@@ -243,8 +287,7 @@ def get_default_models(config_path: str = "mcp_agent.config.yaml"):
     """
     try:
         if os.path.exists(config_path):
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = yaml.safe_load(f)
+            config = _load_yaml_file_cached(config_path)
 
             # Handle null values in config sections
             anthropic_config = config.get("anthropic") or {}
@@ -326,8 +369,7 @@ def get_document_segmentation_config(
     """
     try:
         if os.path.exists(config_path):
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = yaml.safe_load(f)
+            config = _load_yaml_file_cached(config_path)
 
             # Get document segmentation config with defaults
             seg_config = config.get("document_segmentation", {})

@@ -5,6 +5,10 @@ import type {
   WorkflowStep,
 } from '../types/workflow';
 
+const isDev = import.meta.env.DEV;
+const MAX_ACTIVITY_LOGS = 500;
+const MAX_STREAMED_CODE_CHARS = 400_000;
+
 // Activity log entry type
 interface ActivityLogEntry {
   id: string;
@@ -114,10 +118,12 @@ export const useWorkflowStore = create<WorkflowState>()(
         workflowType: workflowType ?? get().workflowType
       }),
 
-  setStatus: (status) => {
-    console.log('[workflowStore] setStatus:', status);
-    set({ status });
-  },
+      setStatus: (status) => {
+        if (isDev) {
+          console.log('[workflowStore] setStatus:', status);
+        }
+        set({ status });
+      },
 
   updateProgress: (progress, message) => {
     const { steps } = get();
@@ -166,9 +172,14 @@ export const useWorkflowStore = create<WorkflowState>()(
   },
 
   appendStreamedCode: (chunk) =>
-    set((state) => ({
-      streamedCode: state.streamedCode + chunk,
-    })),
+    set((state) => {
+      const next = state.streamedCode + chunk;
+      if (next.length <= MAX_STREAMED_CODE_CHARS) {
+        return { streamedCode: next };
+      }
+      // Keep the tail, which is what users tend to care about during streaming.
+      return { streamedCode: next.slice(-MAX_STREAMED_CODE_CHARS) };
+    }),
 
   setCurrentFile: (filename) => set({ currentFile: filename }),
 
@@ -178,54 +189,67 @@ export const useWorkflowStore = create<WorkflowState>()(
     })),
 
   addActivityLog: (message, progress, type = 'progress') =>
-    set((state) => ({
-      activityLogs: [
-        ...state.activityLogs,
-        {
-          id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-          timestamp: new Date(),
-          message,
-          progress,
-          type,
-        },
-      ],
-    })),
+    set((state) => {
+      const nextEntry = {
+        id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+        timestamp: new Date(),
+        message,
+        progress,
+        type,
+      };
 
-  setPendingInteraction: (interaction) => {
-    console.log('[workflowStore] setPendingInteraction:', interaction?.type);
-    set({
-      pendingInteraction: interaction,
-      isWaitingForInput: interaction !== null,
-    });
-  },
+      if (state.activityLogs.length < MAX_ACTIVITY_LOGS) {
+        return { activityLogs: [...state.activityLogs, nextEntry] };
+      }
 
-  clearInteraction: () => {
-    console.log('[workflowStore] clearInteraction');
-    set({
-      pendingInteraction: null,
-      isWaitingForInput: false,
-    });
-  },
+      const activityLogs = state.activityLogs.slice(1);
+      activityLogs.push(nextEntry);
+      return { activityLogs };
+    }),
 
-  setResult: (result) => {
-    console.log('[workflowStore] setResult:', result);
-    set({ result });
-  },
+      setPendingInteraction: (interaction) => {
+        if (isDev) {
+          console.log('[workflowStore] setPendingInteraction:', interaction?.type);
+        }
+        set({
+          pendingInteraction: interaction,
+          isWaitingForInput: interaction !== null,
+        });
+      },
+
+      clearInteraction: () => {
+        if (isDev) {
+          console.log('[workflowStore] clearInteraction');
+        }
+        set({
+          pendingInteraction: null,
+          isWaitingForInput: false,
+        });
+      },
+
+      setResult: (result) => {
+        if (isDev) {
+          console.log('[workflowStore] setResult:', result);
+        }
+        set({ result });
+      },
 
   setError: (error) => set({ error, status: error ? 'error' : get().status }),
 
   setNeedsRecovery: (needs) => set({ needsRecovery: needs }),
 
-  reset: () => {
-    console.log('[workflowStore] Resetting state and clearing localStorage');
-    // Clear localStorage explicitly to ensure clean state
-    try {
-      localStorage.removeItem('deepcode-workflow');
-    } catch (e) {
-      console.error('[workflowStore] Failed to clear localStorage:', e);
-    }
-    set(initialState);
-  },
+      reset: () => {
+        if (isDev) {
+          console.log('[workflowStore] Resetting state and clearing localStorage');
+        }
+        // Clear localStorage explicitly to ensure clean state
+        try {
+          localStorage.removeItem('deepcode-workflow');
+        } catch (e) {
+          console.error('[workflowStore] Failed to clear localStorage:', e);
+        }
+        set(initialState);
+      },
     }),
     {
       name: 'deepcode-workflow',

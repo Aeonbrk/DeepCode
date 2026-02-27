@@ -5,7 +5,8 @@ services:
       dockerfile: deepcode_docker/Dockerfile
     container_name: deepcode
     ports:
-      - "8000:8000"
+      # Safer default: bind to localhost to reduce accidental LAN exposure.
+      - "127.0.0.1:8000:8000"
     volumes:
       # Configuration (required)
       - ../mcp_agent.config.yaml:/app/mcp_agent.config.yaml:ro

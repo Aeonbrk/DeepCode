@@ -1,6 +1,6 @@
 import { useState, useRef, KeyboardEvent } from 'react';
 import { Send, Loader2 } from 'lucide-react';
-import { motion } from 'framer-motion';
+import { m } from 'framer-motion';
 
 interface ChatInputProps {
   onSubmit: (message: string) => void;
@@ -45,7 +45,7 @@ export default function ChatInput({
   };
 
   return (
-    <motion.div
+    <m.div
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
       className="relative"
@@ -78,6 +78,6 @@ export default function ChatInput({
       <p className="mt-2 text-xs text-gray-400 text-center">
         Press Enter to send, Shift+Enter for new line
       </p>
-    </motion.div>
+    </m.div>
   );
 }

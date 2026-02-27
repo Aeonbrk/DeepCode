@@ -10,7 +10,7 @@ import { useSessionStore } from '../../stores/sessionStore';
 
 export default function Sidebar() {
   const location = useLocation();
-  const { recentProjects } = useSessionStore();
+  const recentProjects = useSessionStore((s) => s.recentProjects);
 
   const menuItems = [
     {

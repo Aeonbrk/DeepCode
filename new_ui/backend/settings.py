@@ -3,6 +3,8 @@ Configuration management for DeepCode New UI Backend
 Reads from existing mcp_agent.config.yaml and mcp_agent.secrets.yaml
 """
 
+import copy
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -22,7 +24,8 @@ class Settings(BaseSettings):
     """Application settings"""
 
     # Server settings
-    host: str = "0.0.0.0"
+    # Safer default: bind to localhost unless explicitly overridden (for example via Docker).
+    host: str = "127.0.0.1"
     port: int = 8000
     debug: bool = True
 
@@ -34,6 +37,9 @@ class Settings(BaseSettings):
         "http://localhost:5173",
         "http://localhost:3000",
         "http://localhost:8000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:8000",
     ]
 
     # File upload settings
@@ -43,6 +49,11 @@ class Settings(BaseSettings):
     # Session settings
     session_timeout: int = 3600  # 1 hour
 
+    # WebSocket log streaming can expose sensitive info. Keep it off by default.
+    enable_logs_ws: bool = False
+    # When enabled, require ws/logs/{session_id} to map to a specific log file.
+    strict_logs_ws_session: bool = True
+
     class Config:
         env_prefix = "DEEPCODE_"
 
@@ -50,22 +61,32 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
+def _load_yaml_file(path: Path) -> Dict[str, Any]:
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except FileNotFoundError:
+        return {}
+    # Return a defensive copy so callers can mutate without polluting the cache.
+    return copy.deepcopy(_load_yaml_file_cached(str(path), mtime_ns))
+
+
+@lru_cache(maxsize=8)
+def _load_yaml_file_cached(path_str: str, mtime_ns: int) -> Dict[str, Any]:
+    # mtime_ns is included to invalidate cache when the file changes.
+    _ = mtime_ns
+    path = Path(path_str)
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
 def load_mcp_config() -> Dict[str, Any]:
     """Load main MCP agent configuration"""
-    if not CONFIG_PATH.exists():
-        return {}
-
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    return _load_yaml_file(CONFIG_PATH)
 
 
 def load_secrets() -> Dict[str, Any]:
     """Load API secrets configuration"""
-    if not SECRETS_PATH.exists():
-        return {}
-
-    with open(SECRETS_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    return _load_yaml_file(SECRETS_PATH)
 
 
 def get_llm_provider() -> str:

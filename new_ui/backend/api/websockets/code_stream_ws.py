@@ -7,7 +7,9 @@ import asyncio
 from datetime import datetime
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from app_utils.ws_security import is_ws_origin_allowed
 from services.workflow_service import workflow_service
+from settings import settings
 
 
 router = APIRouter()
@@ -29,6 +31,25 @@ async def code_stream_websocket(websocket: WebSocket, task_id: str):
         "timestamp": str
     }
     """
+    origin = websocket.headers.get("origin")
+    if not is_ws_origin_allowed(
+        origin,
+        allowed_origins=settings.cors_origins,
+        debug=settings.debug,
+        env=settings.env,
+    ):
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "type": "error",
+                "task_id": task_id,
+                "error": "WebSocket origin not allowed",
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        )
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
 
     task = workflow_service.get_task(task_id)

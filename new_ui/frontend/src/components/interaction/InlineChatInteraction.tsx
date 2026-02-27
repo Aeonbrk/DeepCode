@@ -6,7 +6,8 @@
  */
 
 import { useState, useCallback } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { AnimatePresence, m } from 'framer-motion';
+import { shallow } from 'zustand/shallow';
 import {
   Send,
   SkipForward,
@@ -31,13 +32,19 @@ interface InlineChatInteractionProps {
 export default function InlineChatInteraction({
   taskId,
   interaction,
-  onComplete
+  onComplete,
 }: InlineChatInteractionProps) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [feedback, setFeedback] = useState('');
   const [showModify, setShowModify] = useState(false);
-  const { clearInteraction, addActivityLog } = useWorkflowStore();
+  const { clearInteraction, addActivityLog } = useWorkflowStore(
+    (s) => ({
+      clearInteraction: s.clearInteraction,
+      addActivityLog: s.addActivityLog,
+    }),
+    shallow
+  );
 
   const handleSubmit = useCallback(async (action: string, data: Record<string, unknown> = {}) => {
     setIsSubmitting(true);
@@ -76,7 +83,7 @@ export default function InlineChatInteraction({
     return (
       <div className="space-y-3">
         {questions.map((q: { id?: string; question: string; hint?: string; category?: string }, index: number) => (
-          <motion.div
+          <m.div
             key={q.id || index}
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
@@ -113,7 +120,7 @@ export default function InlineChatInteraction({
                 />
               </div>
             </div>
-          </motion.div>
+          </m.div>
         ))}
 
         <div className="flex justify-end space-x-2 pt-3">
@@ -160,7 +167,7 @@ export default function InlineChatInteraction({
 
         <AnimatePresence>
           {showModify && (
-            <motion.div
+            <m.div
               initial={{ opacity: 0, height: 0 }}
               animate={{ opacity: 1, height: 'auto' }}
               exit={{ opacity: 0, height: 0 }}
@@ -173,7 +180,7 @@ export default function InlineChatInteraction({
                 onChange={(e) => setFeedback(e.target.value)}
                 disabled={isSubmitting}
               />
-            </motion.div>
+            </m.div>
           )}
         </AnimatePresence>
 
@@ -272,8 +279,11 @@ export default function InlineChatInteraction({
     }
   };
 
+  // Compute once per render instead of invoking in JSX.
+  const content = renderContent();
+
   return (
-    <motion.div
+    <m.div
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
       className="flex items-start space-x-3"
@@ -295,9 +305,9 @@ export default function InlineChatInteraction({
           </div>
 
           {/* Content */}
-          {renderContent()}
+          {content}
         </div>
       </div>
-    </motion.div>
+    </m.div>
   );
 }

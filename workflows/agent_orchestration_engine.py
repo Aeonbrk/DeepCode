@@ -65,6 +65,63 @@ from workflows.agents.requirement_analysis_agent import RequirementAnalysisAgent
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"  # Prevent .pyc file generation
 
 
+def _is_truthy_env(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+_VERBOSE_LOGS = _is_truthy_env("DEEPCODE_VERBOSE_LOGS")
+
+# Best-effort redaction for stdout logs (defense-in-depth; not a substitute for auth).
+_REDACTION_RULES: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"(?i)\bAuthorization:\s*Bearer\s+[^\s]+"), "Authorization: Bearer ***"),
+    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9\-_\.=:+/]{10,}"), "Bearer ***"),
+    (re.compile(r"\bsk-proj-[A-Za-z0-9]{10,}\b"), "sk-proj-***"),
+    (re.compile(r"\bsk-[A-Za-z0-9]{10,}\b"), "sk-***"),
+    (re.compile(r"\bsk-ant-[A-Za-z0-9\-_]{10,}\b"), "sk-ant-***"),
+    (re.compile(r"\bAIza[0-9A-Za-z\-_]{10,}\b"), "AIza***"),
+    (
+        re.compile(
+            r"(?i)\b([A-Z0-9_]*(?:API_KEY|ACCESS_KEY|SECRET_KEY|TOKEN|PASSWORD)[A-Z0-9_]*)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s]+)"
+        ),
+        r"\1=***",
+    ),
+    (
+        re.compile(
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+            re.DOTALL,
+        ),
+        "-----BEGIN PRIVATE KEY-----***-----END PRIVATE KEY-----",
+    ),
+]
+
+
+def _redact_text(value: str | None) -> str:
+    if not value:
+        return ""
+
+    redacted = value
+    for pattern, replacement in _REDACTION_RULES:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def _preview_text(value: str | None, *, limit: int) -> str:
+    redacted = _redact_text(value)
+    if len(redacted) <= limit:
+        return redacted
+    return redacted[:limit].rstrip() + "..."
+
+
+def _shorten_path(value: str | None, *, limit: int = 120) -> str:
+    if not value:
+        return ""
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return "..." + text[-limit:]
+
+
 def _assess_output_completeness(text: str) -> float:
     """
     精准评估YAML格式实现计划的完整性
@@ -386,7 +443,7 @@ async def run_research_analyzer(prompt_text: str, logger) -> str:
         # Log input information for debugging
         print("📊 Starting research analysis...")
         print(f"Input prompt length: {len(prompt_text) if prompt_text else 0}")
-        print(f"Input preview: {prompt_text[:200] if prompt_text else 'None'}...")
+        print(f"Input preview: {_preview_text(prompt_text, limit=200)}")
 
         if not prompt_text or prompt_text.strip() == "":
             raise ValueError(
@@ -440,10 +497,24 @@ async def run_research_analyzer(prompt_text: str, logger) -> str:
             print("analyzer: Connected to server, calling list_tools...")
             try:
                 tools = await analyzer_agent.list_tools()
-                print(
-                    "Tools available:",
-                    tools.model_dump() if hasattr(tools, "model_dump") else str(tools),
-                )
+                if _VERBOSE_LOGS:
+                    print(
+                        "Tools available (verbose):",
+                        _preview_text(
+                            tools.model_dump_json()
+                            if hasattr(tools, "model_dump_json")
+                            else str(tools),
+                            limit=2000,
+                        ),
+                    )
+                else:
+                    tool_list = getattr(tools, "tools", None)
+                    count = len(tool_list) if isinstance(tool_list, list) else None
+                    print(
+                        f"Tools available: {count}"
+                        if count is not None
+                        else "Tools available"
+                    )
             except Exception as e:
                 print(f"Failed to list tools: {e}")
 
@@ -466,7 +537,6 @@ async def run_research_analyzer(prompt_text: str, logger) -> str:
 
             max_retries = 3
             raw_result = None
-            last_error = None
             for attempt in range(1, max_retries + 1):
                 try:
                     raw_result = await analyzer.generate_str(
@@ -491,7 +561,6 @@ async def run_research_analyzer(prompt_text: str, logger) -> str:
 
                     break
                 except Exception as e:
-                    last_error = e
                     print(
                         f"❌ LLM generation failed on attempt {attempt}/{max_retries}: {e}"
                     )
@@ -504,8 +573,13 @@ async def run_research_analyzer(prompt_text: str, logger) -> str:
             # Clean LLM output to ensure only pure JSON is returned
             try:
                 clean_result = extract_clean_json(raw_result)
-                print(f"Raw LLM output: {raw_result}")
-                print(f"Cleaned JSON output: {clean_result}")
+                preview_limit = 2000 if _VERBOSE_LOGS else 400
+                print(
+                    f"Raw LLM output (preview): {_preview_text(str(raw_result), limit=preview_limit)}"
+                )
+                print(
+                    f"Cleaned JSON output (preview): {_preview_text(clean_result, limit=preview_limit)}"
+                )
 
                 # Log to SimpleLLMLogger
                 if hasattr(logger, "log_response"):
@@ -517,14 +591,18 @@ async def run_research_analyzer(prompt_text: str, logger) -> str:
 
                 if not clean_result or clean_result.strip() == "":
                     print("❌ CRITICAL: clean_result is empty after JSON extraction!")
-                    print(f"Original raw_result was: {raw_result}")
+                    print(
+                        f"Original raw_result (preview): {_preview_text(str(raw_result), limit=preview_limit)}"
+                    )
                     raise ValueError("JSON extraction resulted in empty output")
 
                 return clean_result
 
             except Exception as e:
                 print(f"❌ JSON extraction failed: {e}")
-                print(f"Raw result was: {raw_result}")
+                print(
+                    f"Raw result (preview): {_preview_text(str(raw_result), limit=2000 if _VERBOSE_LOGS else 400)}"
+                )
                 raise
 
     except Exception as e:
@@ -876,7 +954,11 @@ The goal is to create a reproduction plan detailed enough for independent implem
                 timeout=analysis_timeout_seconds,
             )
 
-            print(f"🔍 Code analysis result:\n{result}")
+            preview_limit = 4000 if _VERBOSE_LOGS else 800
+            print(
+                "🔍 Code analysis result (preview): "
+                + _preview_text(result, limit=preview_limit)
+            )
 
             completeness_score = _assess_output_completeness(
                 result
@@ -1035,8 +1117,8 @@ async def orchestrate_research_analysis_agent(
         )
     analysis_result = await run_research_analyzer(input_source, logger)
 
-    # Add brief pause for system stability
-    await asyncio.sleep(5)
+    # Yield to the event loop without adding a fixed latency floor.
+    await asyncio.sleep(0)
 
     # Step 2: Download Processing
     if progress_callback:
@@ -1044,7 +1126,9 @@ async def orchestrate_research_analysis_agent(
             25, "📥 Processing downloads and preparing document structure..."
         )
     download_result = await run_resource_processor(analysis_result, logger)
-    print("download result:", download_result)
+    print(
+        f"Download result (preview): {_preview_text(download_result, limit=1000 if _VERBOSE_LOGS else 300)}"
+    )
 
     return analysis_result, download_result
 
@@ -1074,8 +1158,10 @@ async def synthesize_workspace_infrastructure_agent(
 
     # Log workspace infrastructure synthesis
     print("🏗️ Intelligent workspace infrastructure synthesized:")
-    print(f"   Base workspace environment: {workspace_dir or 'auto-detected'}")
-    print(f"   Research workspace: {paper_dir}")
+    print(
+        f"   Base workspace environment: {_shorten_path(workspace_dir, limit=80) or 'auto-detected'}"
+    )
+    print(f"   Research workspace: {_shorten_path(paper_dir, limit=80)}")
     print("   AI-driven path optimization: active")
 
     return {
@@ -1327,7 +1413,8 @@ async def automate_repository_acquisition_agent(
     if progress_callback:
         progress_callback(60, "🤖 Automating intelligent repository acquisition...")
 
-    await asyncio.sleep(5)  # Brief pause for stability
+    # Yield to the event loop without adding a fixed latency floor.
+    await asyncio.sleep(0)
 
     try:
         download_result = await github_repo_download(
@@ -1403,7 +1490,8 @@ async def orchestrate_codebase_intelligence_agent(
     print(
         "Initiating intelligent codebase analysis with AI-powered relationship mapping..."
     )
-    await asyncio.sleep(2)  # Brief pause before starting indexing
+    # Yield to the event loop without adding a fixed latency floor.
+    await asyncio.sleep(0)
 
     # Check if code_base directory exists and has content
     code_base_path = os.path.join(dir_info["paper_dir"], "code_base")
@@ -1534,7 +1622,8 @@ async def synthesize_code_implementation_agent(
     print(
         "Launching intelligent code synthesis with AI-driven implementation strategies..."
     )
-    await asyncio.sleep(3)  # Brief pause before starting implementation
+    # Yield to the event loop without adding a fixed latency floor.
+    await asyncio.sleep(0)
 
     try:
         # Create code implementation workflow instance based on indexing preference
@@ -1610,7 +1699,7 @@ async def run_chat_planning_agent(user_input: str, logger) -> str:
     try:
         print("💬 Starting chat-based planning agent...")
         print(f"Input length: {len(user_input) if user_input else 0}")
-        print(f"Input preview: {user_input[:200] if user_input else 'None'}...")
+        print(f"Input preview: {_preview_text(user_input, limit=200)}")
 
         if not user_input or user_input.strip() == "":
             raise ValueError(
@@ -1628,10 +1717,24 @@ async def run_chat_planning_agent(user_input: str, logger) -> str:
             print("chat_planning: Connected to server, calling list_tools...")
             try:
                 tools = await chat_planning_agent.list_tools()
-                print(
-                    "Tools available:",
-                    tools.model_dump() if hasattr(tools, "model_dump") else str(tools),
-                )
+                if _VERBOSE_LOGS:
+                    print(
+                        "Tools available (verbose):",
+                        _preview_text(
+                            tools.model_dump_json()
+                            if hasattr(tools, "model_dump_json")
+                            else str(tools),
+                            limit=2000,
+                        ),
+                    )
+                else:
+                    tool_list = getattr(tools, "tools", None)
+                    count = len(tool_list) if isinstance(tool_list, list) else None
+                    print(
+                        f"Tools available: {count}"
+                        if count is not None
+                        else "Tools available"
+                    )
             except Exception as e:
                 print(f"Failed to list tools: {e}")
 
@@ -1691,7 +1794,10 @@ Please provide a detailed implementation plan that covers all aspects needed for
                 raise ValueError("Chat planning agent produced empty output")
 
             print("🎯 Chat planning completed successfully")
-            print(f"Planning result preview: {raw_result[:500]}...")
+            preview_limit = 2000 if _VERBOSE_LOGS else 500
+            print(
+                f"Planning result preview: {_preview_text(raw_result, limit=preview_limit)}"
+            )
 
             return raw_result
 
@@ -1774,7 +1880,8 @@ async def execute_multi_agent_research_pipeline(
         dir_info = await synthesize_workspace_infrastructure_agent(
             download_result, logger, workspace_dir
         )
-        await asyncio.sleep(5)
+        # Yield to the event loop without adding a fixed latency floor.
+        await asyncio.sleep(0)
 
         # Phase 3.5: Document Segmentation and Preprocessing
 
@@ -2038,7 +2145,8 @@ The following implementation plan was generated by the AI chat planning agent:
         dir_info = await synthesize_workspace_infrastructure_agent(
             synthetic_download_result, logger, workspace_dir
         )
-        await asyncio.sleep(10)  # Brief pause for file system operations
+        # Yield to the event loop without adding a fixed latency floor.
+        await asyncio.sleep(0)
 
         # Phase 3: Save Planning Result
         if progress_callback:
