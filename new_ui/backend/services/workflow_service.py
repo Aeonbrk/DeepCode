@@ -219,12 +219,16 @@ class WorkflowService:
                     # Compat: allow OpenAI reasoning_effort values (e.g. xhigh) used by
                     # some OpenAI-compatible gateways.
                     from utils.mcp_agent_compat import (
+                        ensure_current_python_on_path,
                         patch_mcp_agent_openai_reasoning_effort,
                         patch_mcp_agent_openai_base_url_routing,
+                        patch_mcp_agent_openai_executor_raise_on_error,
                     )
 
+                    ensure_current_python_on_path()
                     patch_mcp_agent_openai_reasoning_effort()
                     patch_mcp_agent_openai_base_url_routing()
+                    patch_mcp_agent_openai_executor_raise_on_error()
                     self._cancellation_checkpoint(task)
                     app = MCPApp(name="paper_to_code", settings=str(CONFIG_PATH))
 
@@ -327,12 +331,16 @@ class WorkflowService:
                     # Compat: allow OpenAI reasoning_effort values (e.g. xhigh) used by
                     # some OpenAI-compatible gateways.
                     from utils.mcp_agent_compat import (
+                        ensure_current_python_on_path,
                         patch_mcp_agent_openai_reasoning_effort,
                         patch_mcp_agent_openai_base_url_routing,
+                        patch_mcp_agent_openai_executor_raise_on_error,
                     )
 
+                    ensure_current_python_on_path()
                     patch_mcp_agent_openai_reasoning_effort()
                     patch_mcp_agent_openai_base_url_routing()
+                    patch_mcp_agent_openai_executor_raise_on_error()
                     self._cancellation_checkpoint(task)
                     app = MCPApp(name="chat_planning", settings=str(CONFIG_PATH))
 

@@ -60,12 +60,16 @@ class CLIWorkflowAdapter:
             # Compat: allow OpenAI reasoning_effort values (e.g. xhigh) used by
             # some OpenAI-compatible gateways.
             from utils.mcp_agent_compat import (
+                ensure_current_python_on_path,
                 patch_mcp_agent_openai_reasoning_effort,
                 patch_mcp_agent_openai_base_url_routing,
+                patch_mcp_agent_openai_executor_raise_on_error,
             )
 
+            ensure_current_python_on_path()
             patch_mcp_agent_openai_reasoning_effort()
             patch_mcp_agent_openai_base_url_routing()
+            patch_mcp_agent_openai_executor_raise_on_error()
             self.app = MCPApp(name="cli_agent_orchestration")
             self.app_context = self.app.run()
             agent_app = await self.app_context.__aenter__()

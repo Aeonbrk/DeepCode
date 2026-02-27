@@ -145,6 +145,70 @@ def _responses_json_partial_usage(model: str, output_text: str) -> dict[str, Any
     }
 
 
+def _responses_json_output_only_text(model: str, text: str) -> dict[str, Any]:
+    now = int(time.time())
+    return {
+        "id": "resp_test_output_only_text",
+        "object": "response",
+        "created_at": now,
+        "model": model,
+        # intentionally omit aggregated output_text; provide text only under output content
+        "output": [
+            {
+                "type": "message",
+                "id": "msg_test",
+                "role": "assistant",
+                "status": "completed",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": text,
+                        "annotations": [],
+                    }
+                ],
+            }
+        ],
+        "parallel_tool_calls": False,
+        "tool_choice": "auto",
+        "tools": [],
+        "usage": {
+            "input_tokens": 2,
+            "output_tokens": 4,
+        },
+    }
+
+
+def _responses_sse_body_from_json(response_json: dict[str, Any]) -> str:
+    """
+    Build a minimal SSE body that ends with `response.completed`.
+    """
+    created = {
+        "type": "response.created",
+        "response": {
+            "id": response_json.get("id", ""),
+            "object": response_json.get("object", "response"),
+            "created_at": response_json.get("created_at", 0),
+            "status": "in_progress",
+            "model": response_json.get("model", ""),
+            "output": [],
+            "output_text": "",
+            "usage": None,
+        },
+    }
+    completed = {
+        "type": "response.completed",
+        "response": response_json,
+    }
+    return "\n\n".join(
+        [
+            f"event: response.created\ndata: {json.dumps(created, ensure_ascii=False)}",
+            f"event: response.completed\ndata: {json.dumps(completed, ensure_ascii=False)}",
+            "data: [DONE]",
+            "",
+        ]
+    )
+
+
 async def _assert_chat_endpoint(raw_base_url: str) -> None:
     info = get_openai_base_url_info(raw_base_url)
     seen: dict[str, str] = {}
@@ -385,6 +449,125 @@ async def _assert_mcp_agent_responses_bridge_partial_usage(raw_base_url: str) ->
     print("responses bridge partial usage: total_tokens derived correctly")
 
 
+async def _assert_mcp_agent_responses_bridge_output_only_text(raw_base_url: str) -> None:
+    """
+    Validate bridge behavior when provider leaves `output_text` empty and only
+    includes assistant text inside `output[].content[]`.
+    """
+    from mcp_agent.config import OpenAISettings
+    from mcp_agent.workflows.llm.augmented_llm_openai import (
+        OpenAICompletionTasks,
+        RequestCompletionRequest,
+    )
+
+    from utils.mcp_agent_compat import (
+        patch_mcp_agent_openai_base_url_routing,
+        patch_mcp_agent_openai_reasoning_effort,
+    )
+
+    patch_mcp_agent_openai_reasoning_effort()
+    patch_mcp_agent_openai_base_url_routing()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/responses"), request.url.path
+        return httpx.Response(
+            200,
+            json=_responses_json_output_only_text(
+                model="gpt-5.2", text="ok-from-output-content"
+            ),
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        cfg = OpenAISettings(api_key="sk-test", base_url=raw_base_url)
+        cfg.http_client = http_client  # type: ignore[attr-defined]
+
+        request = RequestCompletionRequest(
+            config=cfg,
+            payload={
+                "model": "gpt-5.2",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_completion_tokens": 16,
+                "reasoning_effort": "xhigh",
+            },
+        )
+        completion = await OpenAICompletionTasks.request_completion_task(request)
+
+    assert completion.choices[0].message.content == "ok-from-output-content"
+    assert completion.usage is not None
+    assert completion.usage.prompt_tokens == 2
+    assert completion.usage.completion_tokens == 4
+    assert completion.usage.total_tokens == 6
+    print("responses bridge output-content fallback: extracted text correctly")
+
+
+async def _assert_mcp_agent_structured_output_only_text(raw_base_url: str) -> None:
+    """
+    Validate structured completion can parse JSON when provider puts text only in
+    `output[].content[]` and leaves `output_text` empty.
+    """
+    from pydantic import BaseModel
+    from mcp_agent.config import OpenAISettings
+    from mcp_agent.workflows.llm.augmented_llm_openai import (
+        OpenAICompletionTasks,
+        RequestStructuredCompletionRequest,
+    )
+
+    from utils.mcp_agent_compat import (
+        patch_mcp_agent_openai_base_url_routing,
+        patch_mcp_agent_openai_reasoning_effort,
+    )
+
+    patch_mcp_agent_openai_reasoning_effort()
+    patch_mcp_agent_openai_base_url_routing()
+
+    class StructuredOut(BaseModel):
+        ok: bool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/responses"), request.url.path
+        return httpx.Response(
+            200,
+            json=_responses_json_output_only_text(model="gpt-5.2", text='{"ok": true}'),
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        cfg = OpenAISettings(api_key="sk-test", base_url=raw_base_url)
+        cfg.http_client = http_client  # type: ignore[attr-defined]
+
+        req = RequestStructuredCompletionRequest(
+            config=cfg,
+            response_model=StructuredOut,
+            response_str="Return {\"ok\": true}",
+            model="gpt-5.2",
+            strict=True,
+        )
+        result = await OpenAICompletionTasks.request_structured_completion_task(req)
+
+    assert result.ok is True
+    print("responses structured output-content fallback: parsed JSON correctly")
+
+
+async def _assert_mcp_agent_responses_sse_string_body(raw_base_url: str) -> None:
+    """
+    Validate bridge behavior when provider returns raw SSE text body instead of a
+    parsed Responses object.
+    """
+    from utils.mcp_agent_compat import (
+        _extract_responses_text,
+        _normalize_responses_result,
+    )
+
+    _ = raw_base_url  # keep signature consistent with other asserts
+    payload = _responses_json_output_only_text(model="gpt-5.2", text="ok-from-sse-body")
+    sse_body = _responses_sse_body_from_json(payload)
+    normalized = _normalize_responses_result(sse_body)
+    text = _extract_responses_text(normalized)
+    assert text == "ok-from-sse-body"
+    print("responses SSE string body: normalized and extracted text correctly")
+
+
 async def main() -> None:
     await _assert_chat_endpoint("https://example.com/codex/v1/chat/completions")
     await _assert_chat_endpoint(
@@ -399,6 +582,15 @@ async def main() -> None:
         "https://example.com/codex/v1/responses"
     )
     await _assert_mcp_agent_responses_bridge_partial_usage(
+        "https://example.com/codex/v1/responses"
+    )
+    await _assert_mcp_agent_responses_bridge_output_only_text(
+        "https://example.com/codex/v1/responses"
+    )
+    await _assert_mcp_agent_structured_output_only_text(
+        "https://example.com/codex/v1/responses"
+    )
+    await _assert_mcp_agent_responses_sse_string_body(
         "https://example.com/codex/v1/responses"
     )
 

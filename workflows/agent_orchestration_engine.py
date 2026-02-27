@@ -393,6 +393,43 @@ async def run_research_analyzer(prompt_text: str, logger) -> str:
                 "Empty or None prompt_text provided to run_research_analyzer"
             )
 
+        # Deterministic fast-path: when the UI/CLI already passes a concrete file path or URL,
+        # we don't need an LLM to "analyze" it. This avoids flaky provider behavior and
+        # removes an unnecessary dependency for local workflows.
+        normalized = (prompt_text or "").strip()
+        try:
+            candidate = normalized
+            if candidate.startswith("file://"):
+                candidate = candidate[7:]
+            candidate = os.path.expanduser(os.path.expandvars(candidate))
+            abs_path = os.path.abspath(candidate)
+            if os.path.isfile(abs_path):
+                result = json.dumps(
+                    {
+                        "input_type": "file",
+                        "path": abs_path,
+                        "input_path": abs_path,
+                    },
+                    ensure_ascii=False,
+                )
+                print("✅ Detected local file input; skipping LLM research analyzer")
+                return result
+        except Exception:
+            # Best-effort only; fall back to the LLM analyzer below.
+            pass
+
+        if normalized.startswith(("http://", "https://")):
+            result = json.dumps(
+                {
+                    "input_type": "url",
+                    "path": normalized,
+                    "input_path": normalized,
+                },
+                ensure_ascii=False,
+            )
+            print("✅ Detected URL input; skipping LLM research analyzer")
+            return result
+
         analyzer_agent = Agent(
             name="ResearchAnalyzerAgent",
             instruction=PAPER_INPUT_ANALYZER_PROMPT,
@@ -427,28 +464,42 @@ async def run_research_analyzer(prompt_text: str, logger) -> str:
                 f"🔄 Making LLM request with params: maxTokens={analysis_params.maxTokens}, temperature={analysis_params.temperature}"
             )
 
-            try:
-                raw_result = await analyzer.generate_str(
-                    message=prompt_text, request_params=analysis_params
-                )
+            max_retries = 3
+            raw_result = None
+            last_error = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    raw_result = await analyzer.generate_str(
+                        message=prompt_text, request_params=analysis_params
+                    )
+                    print("✅ LLM request completed")
+                    print(f"Raw result type: {type(raw_result)}")
+                    print(f"Raw result length: {len(raw_result) if raw_result else 0}")
 
-                print("✅ LLM request completed")
-                print(f"Raw result type: {type(raw_result)}")
-                print(f"Raw result length: {len(raw_result) if raw_result else 0}")
+                    if not raw_result or not str(raw_result).strip():
+                        raise ValueError("LLM returned empty result")
 
-                if not raw_result:
-                    print("❌ CRITICAL: raw_result is empty or None!")
-                    print("This could indicate:")
-                    print("1. LLM API call failed silently")
-                    print("2. API rate limiting or quota exceeded")
-                    print("3. Network connectivity issues")
-                    print("4. MCP server communication problems")
-                    raise ValueError("LLM returned empty result")
+                    raw_lower = str(raw_result).lower()
+                    if (
+                        "<html" in raw_lower
+                        and "bad gateway" in raw_lower
+                        or "error code 502" in raw_lower
+                    ):
+                        raise ValueError(
+                            "LLM gateway returned HTML error body instead of model output"
+                        )
 
-            except Exception as e:
-                print(f"❌ LLM generation failed: {e}")
-                print(f"Exception type: {type(e)}")
-                raise
+                    break
+                except Exception as e:
+                    last_error = e
+                    print(
+                        f"❌ LLM generation failed on attempt {attempt}/{max_retries}: {e}"
+                    )
+                    print(f"Exception type: {type(e)}")
+                    if attempt < max_retries:
+                        await asyncio.sleep(min(2 * attempt, 6))
+                    else:
+                        raise
 
             # Clean LLM output to ensure only pure JSON is returned
             try:
@@ -728,14 +779,18 @@ async def run_code_analyzer(
     )
 
     base_max_tokens, _ = get_token_limits()
+    # Keep planning responses bounded for reliable end-to-end completion.
+    # Very large token ceilings can cause long-running generations that appear stuck.
+    planning_token_cap = 12288
+    analysis_timeout_seconds = 300
 
     # STEP 3: Configure parameters - minimal tool filter since paper content is provided
     if use_segmentation:
-        max_tokens_limit = base_max_tokens
+        max_tokens_limit = min(base_max_tokens, planning_token_cap)
         temperature = 0.2
         max_iterations = 5
         print(
-            f"🧠 Using SEGMENTED mode: max_tokens={base_max_tokens} for complete YAML output"
+            f"🧠 Using SEGMENTED mode: max_tokens={max_tokens_limit} for complete YAML output"
         )
 
         # Segmentation mode: Only use segmentation tools if needed (paper content already provided)
@@ -746,11 +801,11 @@ async def run_code_analyzer(
             # "brave" not in filter = all brave tools available for searching
         }
     else:
-        max_tokens_limit = base_max_tokens
+        max_tokens_limit = min(base_max_tokens, planning_token_cap)
         temperature = 0.3
         max_iterations = 2
         print(
-            f"🧠 Using TRADITIONAL mode: max_tokens={base_max_tokens} for complete YAML output"
+            f"🧠 Using TRADITIONAL mode: max_tokens={max_tokens_limit} for complete YAML output"
         )
 
         # Traditional mode: No filesystem tools needed (paper content already provided)
@@ -770,6 +825,7 @@ async def run_code_analyzer(
         maxTokens=max_tokens_limit,
         temperature=temperature,
         max_iterations=max_iterations,
+        reasoning_effort="low",
         tool_filter=tool_filter
         if tool_filter
         else None,  # None = all tools, empty dict = no filtering
@@ -813,8 +869,11 @@ The goal is to create a reproduction plan detailed enough for independent implem
             print(
                 f"🚀 Attempting code analysis (attempt {retry_count + 1}/{max_retries})"
             )
-            result = await code_aggregator_agent.generate_str(
-                message=message, request_params=enhanced_params
+            result = await asyncio.wait_for(
+                code_aggregator_agent.generate_str(
+                    message=message, request_params=enhanced_params
+                ),
+                timeout=analysis_timeout_seconds,
             )
 
             print(f"🔍 Code analysis result:\n{result}")

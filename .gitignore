@@ -78,3 +78,12 @@ nanobot_config.json
 
 # Plans
 PLANS.md
+
+# Uploads PDFs
+uploads/
+pdfs/
+
+# Playwright artifacts (UI automation)
+.playwright-cli/
+.playwright/
+deepcode-paper-progress*.yaml

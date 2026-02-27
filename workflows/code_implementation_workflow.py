@@ -33,6 +33,7 @@ from workflows.agents import CodeImplementationAgent
 from workflows.agents.memory_agent_concise import ConciseMemoryAgent
 from config.mcp_tool_definitions import get_mcp_tools
 from utils.llm_utils import get_preferred_llm_class, get_default_models, load_api_config
+from utils.openai_compat import get_openai_base_url_info, OpenAIEndpointHint
 # DialogueLogger removed - no longer needed
 
 
@@ -588,6 +589,18 @@ Requirements:
                 openai_config = self.api_config.get("openai", {})
                 base_url = openai_config.get("base_url")
                 default_query = openai_config.get("default_query")
+                endpoint_hint = None
+
+                if base_url:
+                    info = get_openai_base_url_info(base_url)
+                    base_url = info.sdk_base_url
+                    endpoint_hint = info.endpoint_hint
+                    if info.default_query:
+                        merged_query = {}
+                        if isinstance(default_query, dict):
+                            merged_query.update(default_query)
+                        merged_query.update(info.default_query)
+                        default_query = merged_query
 
                 if base_url:
                     client = AsyncOpenAI(
@@ -601,13 +614,30 @@ Requirements:
                 model_name = self.default_models.get("openai", "o3-mini")
 
                 try:
-                    await client.chat.completions.create(
-                        model=model_name,
-                        max_tokens=20,
-                        messages=[{"role": "user", "content": "test"}],
-                    )
+                    if endpoint_hint == OpenAIEndpointHint.RESPONSES:
+                        await client.responses.create(
+                            model=model_name,
+                            input=[
+                                {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": "test"}],
+                                }
+                            ],
+                            max_output_tokens=20,
+                        )
+                    else:
+                        await client.chat.completions.create(
+                            model=model_name,
+                            max_tokens=20,
+                            messages=[{"role": "user", "content": "test"}],
+                        )
                 except Exception as e:
-                    if "max_tokens" in str(e) and "max_completion_tokens" in str(e):
+                    if (
+                        endpoint_hint != OpenAIEndpointHint.RESPONSES
+                        and "max_tokens" in str(e)
+                        and "max_completion_tokens" in str(e)
+                    ):
                         self.logger.info(
                             f"Model {model_name} requires max_completion_tokens parameter"
                         )

@@ -105,12 +105,16 @@ async def process_input_async(
         # Compat: allow OpenAI reasoning_effort values (e.g. xhigh) used by
         # some OpenAI-compatible gateways.
         from utils.mcp_agent_compat import (
+            ensure_current_python_on_path,
             patch_mcp_agent_openai_reasoning_effort,
             patch_mcp_agent_openai_base_url_routing,
+            patch_mcp_agent_openai_executor_raise_on_error,
         )
 
+        ensure_current_python_on_path()
         patch_mcp_agent_openai_reasoning_effort()
         patch_mcp_agent_openai_base_url_routing()
+        patch_mcp_agent_openai_executor_raise_on_error()
 
         # Create and use MCP app in the same async context
         app = MCPApp(name="paper_to_code")
