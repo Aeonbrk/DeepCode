@@ -15,6 +15,7 @@ import { useEffect, useCallback, useState } from 'react';
 import { useWorkflowStore } from '../stores/workflowStore';
 import { workflowsApi } from '../services/api';
 import { PAPER_TO_CODE_STEPS, CHAT_PLANNING_STEPS } from '../types/workflow';
+import { shallow } from 'zustand/shallow';
 
 interface RecoveryState {
   isRecovering: boolean;
@@ -23,6 +24,8 @@ interface RecoveryState {
 }
 
 export function useTaskRecovery() {
+  const isDev = import.meta.env.DEV;
+
   const {
     activeTaskId,
     workflowType,
@@ -35,7 +38,22 @@ export function useTaskRecovery() {
     setError,
     setNeedsRecovery,
     reset,
-  } = useWorkflowStore();
+  } = useWorkflowStore(
+    (s) => ({
+      activeTaskId: s.activeTaskId,
+      workflowType: s.workflowType,
+      status: s.status,
+      setActiveTask: s.setActiveTask,
+      setStatus: s.setStatus,
+      setSteps: s.setSteps,
+      updateProgress: s.updateProgress,
+      setResult: s.setResult,
+      setError: s.setError,
+      setNeedsRecovery: s.setNeedsRecovery,
+      reset: s.reset,
+    }),
+    shallow
+  );
 
   const [recoveryState, setRecoveryState] = useState<RecoveryState>({
     isRecovering: false,
@@ -49,17 +67,23 @@ export function useTaskRecovery() {
       return;
     }
 
-    console.log('[TaskRecovery] Attempting to recover task:', activeTaskId);
+    if (isDev) {
+      console.log('[TaskRecovery] Attempting to recover task:', activeTaskId);
+    }
     setRecoveryState({ isRecovering: true, recoveredTaskId: null, error: null });
 
     try {
       // Query backend for task status
       const taskStatus = await workflowsApi.getStatus(activeTaskId);
-      console.log('[TaskRecovery] Task status from backend:', taskStatus);
+      if (isDev) {
+        console.log('[TaskRecovery] Task status from backend:', taskStatus);
+      }
 
       if (taskStatus.status === 'running') {
         // Task is still running - restore steps and let WebSocket reconnect
-        console.log('[TaskRecovery] Task still running, reconnecting...');
+        if (isDev) {
+          console.log('[TaskRecovery] Task still running, reconnecting...');
+        }
 
         // Restore steps based on workflow type
         if (workflowType === 'paper-to-code') {
@@ -81,7 +105,9 @@ export function useTaskRecovery() {
 
       } else if (taskStatus.status === 'completed') {
         // Task completed while we were away
-        console.log('[TaskRecovery] Task completed, syncing final state...');
+        if (isDev) {
+          console.log('[TaskRecovery] Task completed, syncing final state...');
+        }
 
         if (workflowType === 'paper-to-code') {
           setSteps(PAPER_TO_CODE_STEPS);
@@ -102,7 +128,9 @@ export function useTaskRecovery() {
 
       } else if (taskStatus.status === 'error') {
         // Task errored while we were away
-        console.log('[TaskRecovery] Task errored, syncing error state...');
+        if (isDev) {
+          console.log('[TaskRecovery] Task errored, syncing error state...');
+        }
 
         setStatus('error');
         setError(taskStatus.error || 'Unknown error');
@@ -116,7 +144,9 @@ export function useTaskRecovery() {
 
       } else {
         // Unknown status, reset
-        console.log('[TaskRecovery] Unknown task status, resetting...');
+        if (isDev) {
+          console.log('[TaskRecovery] Unknown task status, resetting...');
+        }
         reset();
         setRecoveryState({
           isRecovering: false,
@@ -131,7 +161,9 @@ export function useTaskRecovery() {
 
       // Always reset on any error - the task is no longer valid
       // This handles 404 (task not found) and any other API errors
-      console.log('[TaskRecovery] Task not recoverable, clearing state...');
+      if (isDev) {
+        console.log('[TaskRecovery] Task not recoverable, clearing state...');
+      }
       reset();
 
       setRecoveryState({
@@ -140,7 +172,20 @@ export function useTaskRecovery() {
         error: null, // Don't show error - just clear state
       });
     }
-  }, [activeTaskId, workflowType, status, setActiveTask, setStatus, setSteps, updateProgress, setResult, setError, setNeedsRecovery, reset]);
+  }, [
+    isDev,
+    activeTaskId,
+    workflowType,
+    status,
+    setActiveTask,
+    setStatus,
+    setSteps,
+    updateProgress,
+    setResult,
+    setError,
+    setNeedsRecovery,
+    reset,
+  ]);
 
   // Run recovery on mount
   useEffect(() => {

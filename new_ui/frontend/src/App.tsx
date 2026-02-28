@@ -1,4 +1,5 @@
 import { Suspense, lazy } from 'react'
+import { LazyMotion, domAnimation } from 'framer-motion'
 import {
   Outlet,
   RouterProvider,
@@ -39,10 +40,10 @@ const router = createBrowserRouter([
 
 function App() {
   return (
-    <>
+    <LazyMotion features={domAnimation}>
       <RouterProvider router={router} />
       <Toaster />
-    </>
+    </LazyMotion>
   )
 }
 

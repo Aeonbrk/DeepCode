@@ -1,4 +1,4 @@
-import { motion } from 'framer-motion';
+import { m } from 'framer-motion';
 import { CheckCircle, Circle, Loader2, XCircle } from 'lucide-react';
 import type { WorkflowStep } from '../../types/workflow';
 
@@ -33,7 +33,7 @@ export default function ProgressTracker({
           <span className="text-gray-500">{currentProgress}%</span>
         </div>
         <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
-          <motion.div
+          <m.div
             className="h-full bg-primary-500 rounded-full"
             initial={{ width: 0 }}
             animate={{ width: `${currentProgress}%` }}
@@ -45,7 +45,7 @@ export default function ProgressTracker({
       {/* Steps */}
       <div className="space-y-3">
         {steps.map((step, index) => (
-          <motion.div
+          <m.div
             key={step.id}
             initial={{ opacity: 0, x: -10 }}
             animate={{ opacity: 1, x: 0 }}
@@ -80,7 +80,7 @@ export default function ProgressTracker({
             {step.status === 'completed' && (
               <span className="text-xs text-green-600 font-medium">Done</span>
             )}
-          </motion.div>
+          </m.div>
         ))}
       </div>
     </div>

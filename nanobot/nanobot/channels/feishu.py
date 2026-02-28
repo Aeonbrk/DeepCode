@@ -248,7 +248,9 @@ class FeishuChannel(BaseChannel):
                 .build()
             )
 
-            response = self._client.im.v1.message.create(request)
+            # lark-oapi SDK call is synchronous; run it in a worker thread to
+            # avoid blocking the async event loop.
+            response = await asyncio.to_thread(self._client.im.v1.message.create, request)
 
             if not response.success():
                 logger.error(

@@ -16,6 +16,11 @@ from dataclasses import dataclass, field
 from contextlib import contextmanager
 
 from settings import CONFIG_PATH, PROJECT_ROOT
+from app_utils.redaction import redact_payload, redact_text
+
+SUBSCRIBER_QUEUE_MAXSIZE = 500
+MAX_STORED_TASKS = 500
+TASK_RETENTION_SECONDS = 6 * 60 * 60  # 6 hours
 
 
 @dataclass
@@ -49,6 +54,41 @@ class WorkflowService:
         self._plugin_integration = None
         self._plugin_enabled = True  # Can be disabled via config
 
+    def _prune_tasks(self) -> None:
+        """Bound in-memory task/subscriber retention to avoid unbounded growth."""
+        terminal_statuses = {"completed", "error", "cancelled"}
+        now = datetime.utcnow()
+
+        # Prune terminal tasks older than retention, but don't delete tasks with subscribers.
+        for task_id, task in list(self._tasks.items()):
+            if task.status not in terminal_statuses:
+                continue
+            if self._subscribers.get(task_id):
+                continue
+            if not task.completed_at:
+                continue
+            if (now - task.completed_at).total_seconds() > TASK_RETENTION_SECONDS:
+                self.cleanup_task(task_id)
+
+        # Cap total stored tasks (prefer deleting oldest terminal tasks with no subscribers).
+        if len(self._tasks) <= MAX_STORED_TASKS:
+            return
+
+        terminal_candidates: list[tuple[datetime, str]] = []
+        for task_id, task in self._tasks.items():
+            if task.status not in terminal_statuses:
+                continue
+            if self._subscribers.get(task_id):
+                continue
+            timestamp = task.completed_at or task.started_at or datetime.min
+            terminal_candidates.append((timestamp, task_id))
+
+        terminal_candidates.sort(key=lambda item: item[0])
+        for _, task_id in terminal_candidates:
+            if len(self._tasks) <= MAX_STORED_TASKS:
+                break
+            self.cleanup_task(task_id)
+
     def _get_plugin_integration(self):
         """Lazy load the plugin integration system."""
         if self._plugin_integration is None and self._plugin_enabled:
@@ -68,6 +108,7 @@ class WorkflowService:
         task = WorkflowTask(task_id=task_id)
         self._tasks[task_id] = task
         self._subscribers[task_id] = []
+        self._prune_tasks()
         return task
 
     def get_task(self, task_id: str) -> Optional[WorkflowTask]:
@@ -79,7 +120,7 @@ class WorkflowService:
         if task_id not in self._subscribers:
             print(f"[Subscribe] Failed: task={task_id[:8]}... not found in subscribers")
             return None
-        queue = asyncio.Queue()
+        queue = asyncio.Queue(maxsize=SUBSCRIBER_QUEUE_MAXSIZE)
         self._subscribers[task_id].append(queue)
         print(
             f"[Subscribe] Success: task={task_id[:8]}... total_subscribers={len(self._subscribers[task_id])}"
@@ -96,6 +137,10 @@ class WorkflowService:
 
     async def _broadcast(self, task_id: str, message: Dict[str, Any]):
         """Broadcast a message to all subscribers of a task."""
+        self._broadcast_nowait(task_id, message)
+
+    def _broadcast_nowait(self, task_id: str, message: Dict[str, Any]) -> None:
+        """Broadcast without awaiting; must run on the event loop thread."""
         if task_id in self._subscribers:
             subscriber_count = len(self._subscribers[task_id])
             print(
@@ -103,7 +148,37 @@ class WorkflowService:
             )
             for queue in self._subscribers[task_id]:
                 try:
-                    await queue.put(message)
+                    queue.put_nowait(message)
+                except asyncio.QueueFull:
+                    msg_type = message.get("type")
+                    is_critical = msg_type in {
+                        "complete",
+                        "error",
+                        "cancelled",
+                        "interaction_required",
+                    }
+
+                    if is_critical:
+                        # Drop backlog so the critical state reaches the frontend.
+                        try:
+                            while True:
+                                queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                        try:
+                            queue.put_nowait(message)
+                        except asyncio.QueueFull:
+                            pass
+                    else:
+                        # For high-frequency updates, keep the most recent by dropping one.
+                        try:
+                            queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                        try:
+                            queue.put_nowait(message)
+                        except asyncio.QueueFull:
+                            pass
                 except Exception as e:
                     print(f"[Broadcast] Failed to send to queue: {e}")
         else:
@@ -121,27 +196,31 @@ class WorkflowService:
     ) -> Callable[[int, str], None]:
         """Create a progress callback that broadcasts to all subscribers"""
         task = self._tasks.get(task_id)
+        loop = asyncio.get_running_loop()
 
         def callback(progress: int, message: str):
             if task and (task.cancel_event.is_set() or task.status == "cancelled"):
                 return
+            safe_message = redact_text(message)
             if task:
                 task.progress = progress
-                task.message = message
+                task.message = safe_message
 
-            # Broadcast to all subscribers
-            asyncio.create_task(
-                self._broadcast(
-                    task_id,
-                    {
-                        "type": "progress",
-                        "task_id": task_id,
-                        "progress": progress,
-                        "message": message,
-                        "timestamp": datetime.utcnow().isoformat(),
-                    },
-                )
-            )
+            msg = {
+                "type": "progress",
+                "task_id": task_id,
+                "progress": progress,
+                "message": safe_message,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+
+            # Avoid unbounded task creation under high-frequency progress updates.
+            # call_soon_threadsafe is safe even if callback is invoked from a worker thread.
+            try:
+                loop.call_soon_threadsafe(self._broadcast_nowait, task_id, msg)
+            except RuntimeError:
+                # Event loop not available (for example during shutdown); best-effort drop.
+                return
 
         return callback
 
@@ -182,7 +261,7 @@ class WorkflowService:
         cancelled_message = {
             "type": "cancelled",
             "task_id": task_id,
-            "reason": reason,
+            "reason": redact_text(reason),
             "timestamp": datetime.utcnow().isoformat(),
         }
         await self._broadcast(task_id, cancelled_message)
@@ -256,10 +335,12 @@ class WorkflowService:
 
                         task.status = "completed"
                         task.progress = 100
-                        task.result = {
-                            "status": "success",
-                            "repo_result": result,
-                        }
+                        task.result = redact_payload(
+                            {
+                                "status": "success",
+                                "repo_result": result,
+                            }
+                        )
                         task.completed_at = datetime.utcnow()
 
                         # Broadcast completion signal to all subscribers
@@ -269,11 +350,12 @@ class WorkflowService:
                                 "type": "complete",
                                 "task_id": task_id,
                                 "status": "success",
-                                "result": task.result,
+                                "result": redact_payload(task.result),
                             },
                         )
                         # Give WebSocket handlers time to receive the completion message
                         await asyncio.sleep(0.5)
+                        self._prune_tasks()
 
                         return task.result
 
@@ -285,7 +367,7 @@ class WorkflowService:
                         task_id, task, "Cancelled by user"
                     )
                 task.status = "error"
-                task.error = str(e)
+                task.error = redact_text(str(e))
                 task.completed_at = datetime.utcnow()
 
                 # Broadcast error signal to all subscribers
@@ -294,11 +376,12 @@ class WorkflowService:
                     {
                         "type": "error",
                         "task_id": task_id,
-                        "error": str(e),
+                        "error": redact_text(str(e)),
                     },
                 )
+                self._prune_tasks()
 
-                return {"status": "error", "error": str(e)}
+                return {"status": "error", "error": redact_text(str(e))}
 
     async def execute_chat_planning(
         self,
@@ -413,26 +496,29 @@ class WorkflowService:
 
                         task.status = "completed"
                         task.progress = 100
-                        task.result = {
-                            "status": "success",
-                            "repo_result": result,
-                        }
+                        task.result = redact_payload(
+                            {
+                                "status": "success",
+                                "repo_result": result,
+                            }
+                        )
                         task.completed_at = datetime.utcnow()
 
-                        # Broadcast completion signal to all subscribers
-                        await self._broadcast(
-                            task_id,
-                            {
-                                "type": "complete",
-                                "task_id": task_id,
-                                "status": "success",
-                                "result": task.result,
-                            },
-                        )
-                        # Give WebSocket handlers time to receive the completion message
-                        await asyncio.sleep(0.5)
+                    # Broadcast completion signal to all subscribers
+                    await self._broadcast(
+                        task_id,
+                        {
+                            "type": "complete",
+                            "task_id": task_id,
+                            "status": "success",
+                            "result": redact_payload(task.result),
+                        },
+                    )
+                    # Give WebSocket handlers time to receive the completion message
+                    await asyncio.sleep(0.5)
+                    self._prune_tasks()
 
-                        return task.result
+                    return task.result
 
             except asyncio.CancelledError as e:
                 return await self._finalize_cancelled(task_id, task, str(e))
@@ -442,7 +528,7 @@ class WorkflowService:
                         task_id, task, "Cancelled by user"
                     )
                 task.status = "error"
-                task.error = str(e)
+                task.error = redact_text(str(e))
                 task.completed_at = datetime.utcnow()
 
                 # Broadcast error signal to all subscribers
@@ -451,11 +537,12 @@ class WorkflowService:
                     {
                         "type": "error",
                         "task_id": task_id,
-                        "error": str(e),
+                        "error": redact_text(str(e)),
                     },
                 )
+                self._prune_tasks()
 
-                return {"status": "error", "error": str(e)}
+                return {"status": "error", "error": redact_text(str(e))}
 
     def cancel_task(self, task_id: str, reason: str = "Cancelled by user") -> bool:
         """Cancel a running task"""
@@ -496,6 +583,7 @@ class WorkflowService:
         except RuntimeError:
             asyncio.run(self._broadcast(task_id, cancelled_message))
 
+        self._prune_tasks()
         return True
 
     def cleanup_task(self, task_id: str):
@@ -511,6 +599,7 @@ class WorkflowService:
 
     def get_recent_tasks(self, limit: int = 10) -> List[WorkflowTask]:
         """Get recent tasks sorted by start time (newest first)"""
+        self._prune_tasks()
         tasks = list(self._tasks.values())
         # Sort by started_at descending (newest first)
         tasks.sort(key=lambda t: t.started_at or datetime.min, reverse=True)

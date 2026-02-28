@@ -84,6 +84,7 @@ export interface WSCompleteMessage {
 export interface WSErrorMessage {
   type: 'error';
   task_id: string;
+  code?: string;
   error: string;
   timestamp: string;
 }

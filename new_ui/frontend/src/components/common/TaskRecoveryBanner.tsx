@@ -4,10 +4,11 @@
  * Shows a notification when a running task is recovered after page refresh.
  */
 
-import { motion, AnimatePresence } from 'framer-motion';
+import { AnimatePresence, m } from 'framer-motion';
 import { RefreshCw, X, ExternalLink } from 'lucide-react';
 import { useWorkflowStore } from '../../stores/workflowStore';
 import { useNavigate } from 'react-router-dom';
+import { shallow } from 'zustand/shallow';
 
 interface TaskRecoveryBannerProps {
   isRecovering: boolean;
@@ -21,7 +22,13 @@ export function TaskRecoveryBanner({
   onDismiss,
 }: TaskRecoveryBannerProps) {
   const navigate = useNavigate();
-  const { workflowType, status } = useWorkflowStore();
+  const { workflowType, status } = useWorkflowStore(
+    (s) => ({
+      workflowType: s.workflowType,
+      status: s.status,
+    }),
+    shallow
+  );
 
   const handleGoToTask = () => {
     if (workflowType === 'chat-planning') {
@@ -44,7 +51,7 @@ export function TaskRecoveryBanner({
 
   return (
     <AnimatePresence>
-      <motion.div
+      <m.div
         initial={{ opacity: 0, y: -50 }}
         animate={{ opacity: 1, y: 0 }}
         exit={{ opacity: 0, y: -50 }}
@@ -80,7 +87,7 @@ export function TaskRecoveryBanner({
             </>
           )}
         </div>
-      </motion.div>
+      </m.div>
     </AnimatePresence>
   );
 }

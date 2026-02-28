@@ -39,7 +39,8 @@ if ! python -c "import pydantic_settings" 2>/dev/null; then
 fi
 
 # Start uvicorn in background
-python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000 &
+# Safer default: bind to localhost unless explicitly overridden.
+python -m uvicorn main:app --reload --host "${DEEPCODE_HOST:-127.0.0.1}" --port 8000 &
 BACKEND_PID=$!
 echo -e "${GREEN}✓ Backend started on http://localhost:8000${NC}"
 echo ""

@@ -7,7 +7,10 @@ import asyncio
 from datetime import datetime
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from app_utils.redaction import redact_payload, redact_text
+from app_utils.ws_security import is_ws_origin_allowed
 from services.workflow_service import workflow_service
+from settings import settings
 
 
 router = APIRouter()
@@ -65,6 +68,27 @@ async def workflow_websocket(websocket: WebSocket, task_id: str):
         "error": str | null  # Only for error type
     }
     """
+    origin = websocket.headers.get("origin")
+    if not is_ws_origin_allowed(
+        origin,
+        allowed_origins=settings.cors_origins,
+        debug=settings.debug,
+        env=settings.env,
+        allow_missing_origin=settings.allow_ws_without_origin,
+    ):
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "type": "error",
+                "task_id": task_id,
+                "code": "WS_ORIGIN_NOT_ALLOWED",
+                "error": redact_text("WebSocket origin not allowed"),
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        )
+        await websocket.close(code=1008)
+        return
+
     connected = False
     queue = None
     task = workflow_service.get_task(task_id)
@@ -74,7 +98,8 @@ async def workflow_websocket(websocket: WebSocket, task_id: str):
             {
                 "type": "error",
                 "task_id": task_id,
-                "error": "Task not found",
+                "code": "TASK_NOT_FOUND",
+                "error": redact_text("Task not found"),
                 "timestamp": datetime.utcnow().isoformat(),
             }
         )
@@ -97,7 +122,7 @@ async def workflow_websocket(websocket: WebSocket, task_id: str):
                 {
                     "type": "cancelled",
                     "task_id": task_id,
-                    "reason": task.message or "Cancelled by user",
+                    "reason": redact_text(task.message or "Cancelled by user"),
                     "timestamp": datetime.utcnow().isoformat(),
                 }
             )
@@ -111,7 +136,7 @@ async def workflow_websocket(websocket: WebSocket, task_id: str):
                 "task_id": task_id,
                 "status": task.status,
                 "progress": task.progress,
-                "message": task.message,
+                "message": redact_text(task.message),
                 "timestamp": datetime.utcnow().isoformat(),
             }
         )
@@ -125,10 +150,12 @@ async def workflow_websocket(websocket: WebSocket, task_id: str):
                     "type": "interaction_required",
                     "task_id": task_id,
                     "interaction_type": task.pending_interaction.get("type"),
-                    "title": task.pending_interaction.get("title"),
-                    "description": task.pending_interaction.get("description"),
-                    "data": task.pending_interaction.get("data"),
-                    "options": task.pending_interaction.get("options"),
+                    "title": redact_text(task.pending_interaction.get("title")),
+                    "description": redact_text(
+                        task.pending_interaction.get("description")
+                    ),
+                    "data": redact_payload(task.pending_interaction.get("data")),
+                    "options": redact_payload(task.pending_interaction.get("options")),
                     "required": task.pending_interaction.get("required"),
                     "timestamp": datetime.utcnow().isoformat(),
                 }
@@ -141,7 +168,7 @@ async def workflow_websocket(websocket: WebSocket, task_id: str):
                     {
                         "type": "complete",
                         "task_id": task_id,
-                        "result": task.result,
+                        "result": redact_payload(task.result),
                         "timestamp": datetime.utcnow().isoformat(),
                     }
                 )
@@ -150,7 +177,7 @@ async def workflow_websocket(websocket: WebSocket, task_id: str):
                     {
                         "type": "error",
                         "task_id": task_id,
-                        "error": task.error,
+                        "error": redact_text(task.error),
                         "timestamp": datetime.utcnow().isoformat(),
                     }
                 )
@@ -159,7 +186,7 @@ async def workflow_websocket(websocket: WebSocket, task_id: str):
                     {
                         "type": "cancelled",
                         "task_id": task_id,
-                        "reason": task.message or "Cancelled by user",
+                        "reason": redact_text(task.message or "Cancelled by user"),
                         "timestamp": datetime.utcnow().isoformat(),
                     }
                 )
@@ -177,7 +204,7 @@ async def workflow_websocket(websocket: WebSocket, task_id: str):
                     print(
                         f"[WorkflowWS] Sending: task={task_id[:8]}... type={msg_type}"
                     )
-                    await websocket.send_json(message)
+                    await websocket.send_json(redact_payload(message))
 
                     # Check if workflow is complete
                     if msg_type in ("complete", "error", "cancelled"):

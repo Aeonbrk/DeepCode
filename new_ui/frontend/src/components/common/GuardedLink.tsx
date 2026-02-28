@@ -6,6 +6,7 @@
  */
 
 import { Link, LinkProps, useLocation } from 'react-router-dom';
+import { shallow } from 'zustand/shallow';
 import { useWorkflowStore } from '../../stores/workflowStore';
 import { useState } from 'react';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -15,7 +16,7 @@ interface GuardedLinkProps extends Omit<LinkProps, 'onClick'> {
 }
 
 export function GuardedLink({ to, children, ...props }: GuardedLinkProps) {
-  const { status } = useWorkflowStore();
+  const { status } = useWorkflowStore((s) => ({ status: s.status }), shallow);
   const location = useLocation();
   const [showDialog, setShowDialog] = useState(false);
 

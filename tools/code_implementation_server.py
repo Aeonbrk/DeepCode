@@ -12,6 +12,7 @@ Usage:
 python tools/code_implementation_server.py
 """
 
+import asyncio
 import os
 import subprocess
 import json
@@ -24,6 +25,7 @@ import tempfile
 import shutil
 import logging
 from datetime import datetime
+from collections import deque
 
 # Set standard output encoding to UTF-8
 if sys.stdout.encoding != "utf-8":
@@ -49,8 +51,75 @@ mcp = FastMCP("code-implementation-server")
 
 # Global variables: workspace directory and operation history
 WORKSPACE_DIR = None
-OPERATION_HISTORY = []
+MAX_OPERATION_HISTORY = 1000
+OPERATION_HISTORY = deque(maxlen=MAX_OPERATION_HISTORY)
+TOTAL_OPERATIONS = 0
 CURRENT_FILES = {}
+_SENSITIVE_KEY_PATTERN = re.compile(
+    r"(?i)(api[_-]?key|access[_-]?key|secret|token|password|authorization)"
+)
+
+_REDACTION_RULES: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"(?i)\bAuthorization:\s*Bearer\s+[^\s]+"), "Authorization: Bearer ***"),
+    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9\-_\.=:+/]{10,}"), "Bearer ***"),
+    (
+        re.compile(r"(?i)\b(x-api-key|api-key|api_key|authorization)\s*:\s*[^\s,;]+"),
+        r"\1: ***",
+    ),
+    (
+        re.compile(
+            r'(?i)("?(?:api[_-]?key|access[_-]?key|secret|token|password|authorization)"?\s*:\s*)("[^"]*"|\'[^\']*\'|[^,\s}\]]+)'
+        ),
+        r"\1***",
+    ),
+    (
+        re.compile(
+            r"(?i)([?&](?:api[_-]?key|access[_-]?key|secret|token|password)=)[^&\s]+"
+        ),
+        r"\1***",
+    ),
+    (re.compile(r"\bsk-proj-[A-Za-z0-9]{10,}\b"), "sk-proj-***"),
+    (re.compile(r"\bsk-[A-Za-z0-9]{10,}\b"), "sk-***"),
+    (re.compile(r"\bsk-ant-[A-Za-z0-9\-_]{10,}\b"), "sk-ant-***"),
+    (re.compile(r"\bAIza[0-9A-Za-z\-_]{10,}\b"), "AIza***"),
+    (
+        re.compile(
+            r"(?i)\b([A-Z0-9_]*(?:API_KEY|ACCESS_KEY|SECRET_KEY|TOKEN|PASSWORD)[A-Z0-9_]*)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s]+)"
+        ),
+        r"\1=***",
+    ),
+    (
+        re.compile(
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+            re.DOTALL,
+        ),
+        "-----BEGIN PRIVATE KEY-----***-----END PRIVATE KEY-----",
+    ),
+]
+
+
+def _redact_text(value: str) -> str:
+    redacted = value
+    for pattern, replacement in _REDACTION_RULES:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def _redact_details(value: Any) -> Any:
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, list):
+        return [_redact_details(v) for v in value]
+    if isinstance(value, dict):
+        redacted_dict: Dict[Any, Any] = {}
+        for k, v in value.items():
+            key_text = str(k)
+            if _SENSITIVE_KEY_PATTERN.search(key_text):
+                redacted_dict[k] = "***"
+            else:
+                redacted_dict[k] = _redact_details(v)
+        return redacted_dict
+    return value
 
 
 def initialize_workspace(workspace_dir: str = None):
@@ -94,20 +163,112 @@ def validate_path(path: str) -> Path:
     if WORKSPACE_DIR is None:
         initialize_workspace()
 
-    full_path = (WORKSPACE_DIR / path).resolve()
-    if not str(full_path).startswith(str(WORKSPACE_DIR)):
-        raise ValueError(f"Path {path} is outside workspace scope")
+    workspace_root = WORKSPACE_DIR.resolve()
+    full_path = (workspace_root / path).resolve()
+    try:
+        full_path.relative_to(workspace_root)
+    except ValueError as exc:
+        raise ValueError(f"Path {path} is outside workspace scope") from exc
     return full_path
 
 
 def log_operation(action: str, details: Dict[str, Any]):
     """Log operation history"""
+    global TOTAL_OPERATIONS
+    TOTAL_OPERATIONS += 1
+    safe_details = _redact_details(details)
     OPERATION_HISTORY.append(
-        {"timestamp": datetime.now().isoformat(), "action": action, "details": details}
+        {
+            "timestamp": datetime.now().isoformat(),
+            "action": action,
+            "details": safe_details,
+        }
     )
 
 
 # ==================== File Operation Tools ====================
+
+
+def _can_stream_line_range(start_line: int = None, end_line: int = None) -> bool:
+    """Whether line-range semantics can be served via streaming iteration."""
+    return (start_line is None or start_line >= 0) and (
+        end_line is None or end_line >= 0
+    )
+
+
+def _read_line_range_streaming(
+    full_path: Path,
+    start_line: int = None,
+    end_line: int = None,
+    count_total_lines: bool = False,
+) -> tuple[str, int, int]:
+    """Read a requested line range without materializing the entire file."""
+    effective_start = start_line or 1
+    effective_end = end_line if end_line else None
+
+    selected_lines: List[str] = []
+    selected_count = 0
+    total_lines = 0
+
+    with open(full_path, "r", encoding="utf-8") as f:
+        for current_line_no, line in enumerate(f, start=1):
+            total_lines = current_line_no
+
+            if effective_end is not None and current_line_no > effective_end:
+                if count_total_lines:
+                    continue
+                break
+
+            if current_line_no < effective_start:
+                continue
+
+            selected_lines.append(line)
+            selected_count += 1
+
+    return "".join(selected_lines), selected_count, total_lines
+
+
+def _read_file_with_optional_range(
+    full_path: Path,
+    start_line: int = None,
+    end_line: int = None,
+    count_original_total: bool = False,
+) -> tuple[str, int, int]:
+    """
+    Read file content with optional line range.
+
+    Uses streaming for non-negative ranges, and falls back to list slicing
+    behavior for edge cases (for example negative line indices).
+    """
+    has_line_range = start_line is not None or end_line is not None
+
+    if has_line_range and _can_stream_line_range(start_line, end_line):
+        content, selected_count, total_lines = _read_line_range_streaming(
+            full_path,
+            start_line=start_line,
+            end_line=end_line,
+            count_total_lines=count_original_total,
+        )
+        original_total = total_lines if count_original_total else selected_count
+        return content, selected_count, original_total
+
+    with open(full_path, "r", encoding="utf-8") as f:
+        all_lines = f.readlines()
+
+    original_total = len(all_lines)
+    selected_lines = all_lines
+
+    if has_line_range:
+        start_idx = (start_line - 1) if start_line else 0
+        end_idx = end_line if end_line else len(all_lines)
+        selected_lines = all_lines[start_idx:end_idx]
+
+    content = "".join(selected_lines)
+    selected_count = len(selected_lines)
+    if not count_original_total:
+        original_total = selected_count
+
+    return content, selected_count, original_total
 
 
 @mcp.tool()
@@ -135,22 +296,15 @@ async def read_file(
             )
             return json.dumps(result, ensure_ascii=False, indent=2)
 
-        with open(full_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        # 处理行号范围
-        if start_line is not None or end_line is not None:
-            start_idx = (start_line - 1) if start_line else 0
-            end_idx = end_line if end_line else len(lines)
-            lines = lines[start_idx:end_idx]
-
-        content = "".join(lines)
+        content, lines_count, _ = _read_file_with_optional_range(
+            full_path, start_line=start_line, end_line=end_line
+        )
 
         result = {
             "status": "success",
             "content": content,
             "file_path": file_path,
-            "total_lines": len(lines),
+            "total_lines": lines_count,
             "size_bytes": len(content.encode("utf-8")),
         }
 
@@ -160,7 +314,7 @@ async def read_file(
                 "file_path": file_path,
                 "start_line": start_line,
                 "end_line": end_line,
-                "lines_read": len(lines),
+                "lines_read": lines_count,
             },
         )
 
@@ -288,19 +442,13 @@ async def read_multiple_files(file_requests: str, max_files: int = 5) -> str:
                     results["summary"]["files_not_found"] += 1
                     continue
 
-                with open(full_path, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-
-                # Handle line range
-                original_line_count = len(lines)
-                if start_line is not None or end_line is not None:
-                    start_idx = (start_line - 1) if start_line else 0
-                    end_idx = end_line if end_line else len(lines)
-                    lines = lines[start_idx:end_idx]
-
-                content = "".join(lines)
+                content, lines_count, original_line_count = _read_file_with_optional_range(
+                    full_path,
+                    start_line=start_line,
+                    end_line=end_line,
+                    count_original_total=True,
+                )
                 size_bytes = len(content.encode("utf-8"))
-                lines_count = len(lines)
 
                 # Record individual file result
                 results["files"][file_path] = {
@@ -708,7 +856,8 @@ async def execute_python(code: str, timeout: int = 30) -> str:
             ensure_workspace_exists()
 
             # Execute Python code
-            result = subprocess.run(
+            result = await asyncio.to_thread(
+                subprocess.run,
                 [sys.executable, temp_file],
                 cwd=WORKSPACE_DIR,
                 capture_output=True,
@@ -779,9 +928,10 @@ async def execute_bash(command: str, timeout: int = 30) -> str:
         # 安全检查：禁止危险命令
         dangerous_commands = ["rm -rf", "sudo", "chmod 777", "mkfs", "dd if="]
         if any(dangerous in command.lower() for dangerous in dangerous_commands):
+            safe_command = _redact_text(command)
             result = {
                 "status": "error",
-                "message": f"Dangerous command execution prohibited: {command}",
+                "message": f"Dangerous command execution prohibited: {safe_command}",
             }
             log_operation(
                 "execute_bash_blocked",
@@ -793,7 +943,8 @@ async def execute_bash(command: str, timeout: int = 30) -> str:
         ensure_workspace_exists()
 
         # Execute command
-        result = subprocess.run(
+        result = await asyncio.to_thread(
+            subprocess.run,
             command,
             shell=True,
             cwd=WORKSPACE_DIR,
@@ -1172,18 +1323,41 @@ async def search_code(
         JSON string of search results
     """
     try:
-        # Determine search directory
+        ensure_workspace_exists()
+        workspace_root = WORKSPACE_DIR.resolve()
+
+        # Determine search directory (must remain within the workspace)
         if search_directory:
-            # If search directory is specified, use the specified directory
             if os.path.isabs(search_directory):
-                search_path = Path(search_directory)
+                search_path = Path(search_directory).resolve()
             else:
-                # Relative path, relative to current working directory
-                search_path = Path.cwd() / search_directory
+                workspace_relative = (workspace_root / search_directory).resolve()
+                # Backward-compatible fallback: historical behavior treated relative
+                # paths as CWD-relative. Keep this only when it still resolves inside
+                # the workspace boundary.
+                cwd_relative = (Path.cwd() / search_directory).resolve()
+                if workspace_relative.exists():
+                    search_path = workspace_relative
+                elif cwd_relative.exists():
+                    search_path = cwd_relative
+                else:
+                    search_path = workspace_relative
         else:
-            # 如果没有指定Search directory，使用默认的WORKSPACE_DIR
-            ensure_workspace_exists()
-            search_path = WORKSPACE_DIR
+            search_path = workspace_root
+
+        try:
+            search_path.relative_to(workspace_root)
+        except ValueError:
+            result = {
+                "status": "error",
+                "message": f"Search directory is outside workspace scope: {search_path}",
+                "pattern": pattern,
+            }
+            log_operation(
+                "search_code_error",
+                {"pattern": pattern, "error": "outside_workspace", "path": str(search_path)},
+            )
+            return json.dumps(result, ensure_ascii=False, indent=2)
 
         # 检查Search directory是否存在
         if not search_path.exists():
@@ -1196,41 +1370,88 @@ async def search_code(
 
         import glob
 
+        if os.path.isabs(file_pattern):
+            result = {
+                "status": "error",
+                "message": f"Absolute file_pattern is not allowed: {file_pattern}",
+                "pattern": pattern,
+                "file_pattern": file_pattern,
+            }
+            log_operation(
+                "search_code_error",
+                {"pattern": pattern, "error": "absolute_file_pattern", "pattern_arg": file_pattern},
+            )
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
+        if use_regex:
+            try:
+                compiled_pattern = re.compile(pattern)
+            except re.error as exc:
+                result = {
+                    "status": "error",
+                    "message": f"Invalid regular expression: {exc}",
+                    "pattern": pattern,
+                    "file_pattern": file_pattern,
+                }
+                log_operation(
+                    "search_code_error",
+                    {"pattern": pattern, "error": "invalid_regex", "file_pattern": file_pattern},
+                )
+                return json.dumps(result, ensure_ascii=False, indent=2)
+        else:
+            compiled_pattern = None
+            pattern_lower = pattern.lower()
+
         # Get matching files
         file_paths = glob.glob(str(search_path / "**" / file_pattern), recursive=True)
 
-        matches = []
+        MAX_RETURNED_MATCHES = 50
+        matches: List[Dict[str, Any]] = []
         total_files_searched = 0
+        total_matches = 0
 
         for file_path in file_paths:
             try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
+                resolved_path = Path(file_path).resolve()
+                try:
+                    resolved_path.relative_to(search_path)
+                except ValueError:
+                    logger.warning(
+                        "Skipping file outside search directory scope: %s", resolved_path
+                    )
+                    continue
+                if not resolved_path.is_file():
+                    continue
 
                 total_files_searched += 1
-                relative_path = os.path.relpath(file_path, search_path)
+                relative_path = os.path.relpath(resolved_path, search_path)
 
-                for line_num, line in enumerate(lines, 1):
-                    if use_regex:
-                        if re.search(pattern, line):
-                            matches.append(
-                                {
-                                    "file": relative_path,
-                                    "line_number": line_num,
-                                    "line_content": line.strip(),
-                                    "match_type": "regex",
-                                }
-                            )
-                    else:
-                        if pattern.lower() in line.lower():
-                            matches.append(
-                                {
-                                    "file": relative_path,
-                                    "line_number": line_num,
-                                    "line_content": line.strip(),
-                                    "match_type": "substring",
-                                }
-                            )
+                with open(resolved_path, "r", encoding="utf-8") as f:
+                    for line_num, line in enumerate(f, 1):
+                        if use_regex:
+                            if compiled_pattern and compiled_pattern.search(line):
+                                total_matches += 1
+                                if len(matches) < MAX_RETURNED_MATCHES:
+                                    matches.append(
+                                        {
+                                            "file": relative_path,
+                                            "line_number": line_num,
+                                            "line_content": line.strip(),
+                                            "match_type": "regex",
+                                        }
+                                    )
+                        else:
+                            if pattern_lower in line.lower():
+                                total_matches += 1
+                                if len(matches) < MAX_RETURNED_MATCHES:
+                                    matches.append(
+                                        {
+                                            "file": relative_path,
+                                            "line_number": line_num,
+                                            "line_content": line.strip(),
+                                            "match_type": "substring",
+                                        }
+                                    )
 
             except Exception as e:
                 logger.warning(f"Error searching file {file_path}: {e}")
@@ -1242,13 +1463,15 @@ async def search_code(
             "file_pattern": file_pattern,
             "use_regex": use_regex,
             "search_directory": str(search_path),
-            "total_matches": len(matches),
+            "total_matches": total_matches,
             "total_files_searched": total_files_searched,
-            "matches": matches[:50],  # 限制返回前50个匹配
+            "matches": matches,  # 限制返回前50个匹配
         }
 
-        if len(matches) > 50:
-            result["note"] = f"显示前50个匹配，总共找到{len(matches)}个匹配"
+        if total_matches > MAX_RETURNED_MATCHES:
+            result["note"] = (
+                f"显示前{MAX_RETURNED_MATCHES}个匹配，总共找到{total_matches}个匹配"
+            )
 
         log_operation(
             "search_code",
@@ -1257,7 +1480,7 @@ async def search_code(
                 "file_pattern": file_pattern,
                 "use_regex": use_regex,
                 "search_directory": str(search_path),
-                "total_matches": len(matches),
+                "total_matches": total_matches,
                 "files_searched": total_files_searched,
             },
         )
@@ -1459,13 +1682,14 @@ async def get_operation_history(last_n: int = 10) -> str:
         JSON string of operation history
     """
     try:
-        recent_history = (
-            OPERATION_HISTORY[-last_n:] if last_n > 0 else OPERATION_HISTORY
-        )
+        history = list(OPERATION_HISTORY)
+        recent_history = history[-last_n:] if last_n > 0 else history
 
         result = {
             "status": "success",
-            "total_operations": len(OPERATION_HISTORY),
+            "total_operations": TOTAL_OPERATIONS,
+            "stored_operations": len(OPERATION_HISTORY),
+            "max_stored_operations": MAX_OPERATION_HISTORY,
             "returned_operations": len(recent_history),
             "workspace": str(WORKSPACE_DIR) if WORKSPACE_DIR else None,
             "history": recent_history,

@@ -1,4 +1,4 @@
-import { motion } from 'framer-motion';
+import { m } from 'framer-motion';
 import { Card } from '../components/common';
 import { WorkflowCanvas } from '../components/workflow';
 import { PAPER_TO_CODE_STEPS, CHAT_PLANNING_STEPS } from '../types/workflow';
@@ -13,7 +13,7 @@ export default function WorkflowEditorPage() {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <motion.div
+      <m.div
         initial={{ opacity: 0, y: -10 }}
         animate={{ opacity: 1, y: 0 }}
       >
@@ -21,7 +21,7 @@ export default function WorkflowEditorPage() {
         <p className="text-gray-500 mt-1">
           Visualize and customize your code generation workflows
         </p>
-      </motion.div>
+      </m.div>
 
       {/* Workflow Selection */}
       <Card>

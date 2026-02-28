@@ -219,13 +219,12 @@ class CodebaseIndexWorkflow:
                 )
                 self.logger.info("📋 Extracted structure preview:")
                 # Show first few lines of extracted tree
-                preview_lines = file_tree.split("\n")[:8]
+                tree_lines = file_tree.splitlines()
+                preview_lines = tree_lines[:8]
                 for line in preview_lines:
                     self.logger.info(f"   {line}")
-                if len(file_tree.split("\n")) > 8:
-                    self.logger.info(
-                        f"   ... {len(file_tree.split('\n')) - 8} more lines"
-                    )
+                if len(tree_lines) > 8:
+                    self.logger.info(f"   ... {len(tree_lines) - 8} more lines")
                 return file_tree
             else:
                 self.logger.warning("⚠️ Unable to extract file tree from initial plan")

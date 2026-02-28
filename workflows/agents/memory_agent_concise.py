@@ -272,10 +272,8 @@ class ConciseMemoryAgent:
                         continue
 
                     # Check if file has a code extension
-                    has_code_ext = any(
-                        file.lower().endswith(ext) for ext in code_extensions
-                    )
-                    if not has_code_ext:
+                    file_extension = os.path.splitext(file.lower())[1]
+                    if file_extension not in code_extensions:
                         continue
 
                     # Get full path and convert to relative path

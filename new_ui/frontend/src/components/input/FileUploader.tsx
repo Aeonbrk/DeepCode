@@ -1,6 +1,6 @@
 import { useCallback, useState } from 'react';
 import { Upload, File, X, Loader2 } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { AnimatePresence, m } from 'framer-motion';
 import { filesApi } from '../../services/api';
 import { toast } from '../common/Toaster';
 
@@ -117,7 +117,7 @@ export default function FileUploader({
     <div className="w-full">
       <AnimatePresence mode="wait">
         {uploadedFile ? (
-          <motion.div
+          <m.div
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.95 }}
@@ -142,9 +142,9 @@ export default function FileUploader({
             >
               <X className="h-4 w-4" />
             </button>
-          </motion.div>
+          </m.div>
         ) : (
-          <motion.div
+          <m.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
@@ -188,7 +188,7 @@ export default function FileUploader({
                 </p>
               </div>
             )}
-          </motion.div>
+          </m.div>
         )}
       </AnimatePresence>
     </div>

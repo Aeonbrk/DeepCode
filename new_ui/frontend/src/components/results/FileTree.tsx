@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { ChevronRight, ChevronDown, File, Folder, FolderOpen } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { AnimatePresence, m } from 'framer-motion';
 import { buildTree } from '../../utils/fileTree';
 import type { FileNode } from '../../utils/fileTree';
 
@@ -11,7 +11,7 @@ interface FileTreeProps {
 }
 
 export default function FileTree({ files, onFileSelect, selectedFile }: FileTreeProps) {
-  const tree = buildTree(files);
+  const tree = useMemo(() => buildTree(files), [files]);
 
   return (
     <div className="rounded-lg border border-gray-200 bg-white overflow-hidden">
@@ -115,14 +115,14 @@ function TreeNode({
 
       <AnimatePresence>
         {node.type === 'folder' && isOpen && node.children && (
-          <motion.div
+          <m.div
             initial={{ opacity: 0, height: 0 }}
             animate={{ opacity: 1, height: 'auto' }}
             exit={{ opacity: 0, height: 0 }}
           >
             {node.children.map((child) => (
               <TreeNode
-                key={child.name}
+                key={`${fullPath}/${child.name}`}
                 node={child}
                 path={fullPath}
                 depth={depth + 1}
@@ -130,7 +130,7 @@ function TreeNode({
                 selectedFile={selectedFile}
               />
             ))}
-          </motion.div>
+          </m.div>
         )}
       </AnimatePresence>
     </div>

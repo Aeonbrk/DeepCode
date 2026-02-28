@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link2, Check, X, Loader2 } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { AnimatePresence, m } from 'framer-motion';
 
 interface UrlInputProps {
   onSubmit: (url: string) => void;
@@ -43,7 +43,7 @@ export default function UrlInput({
   };
 
   return (
-    <motion.div
+    <m.div
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
       className="w-full"
@@ -70,7 +70,7 @@ export default function UrlInput({
         <div className="absolute inset-y-0 right-0 flex items-center pr-2">
           <AnimatePresence mode="wait">
             {isValid !== null && (
-              <motion.span
+              <m.span
                 initial={{ opacity: 0, scale: 0.8 }}
                 animate={{ opacity: 1, scale: 1 }}
                 exit={{ opacity: 0, scale: 0.8 }}
@@ -81,7 +81,7 @@ export default function UrlInput({
                 ) : (
                   <X className="h-4 w-4 text-red-500" />
                 )}
-              </motion.span>
+              </m.span>
             )}
           </AnimatePresence>
           <button
@@ -103,6 +103,6 @@ export default function UrlInput({
       <p className="mt-2 text-xs text-gray-400">
         Supported: ArXiv, GitHub, and direct PDF links
       </p>
-    </motion.div>
+    </m.div>
   );
 }

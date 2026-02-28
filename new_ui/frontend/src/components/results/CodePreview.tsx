@@ -1,5 +1,7 @@
-import Editor from '@monaco-editor/react';
+import { Suspense, lazy } from 'react';
 import { Code } from 'lucide-react';
+
+const MonacoEditor = lazy(() => import('@monaco-editor/react'));
 
 interface CodePreviewProps {
   code: string;
@@ -40,20 +42,28 @@ export default function CodePreview({
         </span>
       </div>
       {code ? (
-        <Editor
-          height="300px"
-          language={detectLanguage(filename)}
-          value={code}
-          theme="vs-light"
-          options={{
-            readOnly: true,
-            minimap: { enabled: false },
-            scrollBeyondLastLine: false,
-            fontSize: 13,
-            fontFamily: "'JetBrains Mono', monospace",
-            padding: { top: 16, bottom: 16 },
-          }}
-        />
+        <Suspense
+          fallback={
+            <div className="h-[300px] flex items-center justify-center text-gray-400">
+              Loading editor...
+            </div>
+          }
+        >
+          <MonacoEditor
+            height="300px"
+            language={detectLanguage(filename)}
+            value={code}
+            theme="vs-light"
+            options={{
+              readOnly: true,
+              minimap: { enabled: false },
+              scrollBeyondLastLine: false,
+              fontSize: 13,
+              fontFamily: "'JetBrains Mono', monospace",
+              padding: { top: 16, bottom: 16 },
+            }}
+          />
+        </Suspense>
       ) : (
         <div className="h-[300px] flex items-center justify-center text-gray-400">
           Select a file to preview

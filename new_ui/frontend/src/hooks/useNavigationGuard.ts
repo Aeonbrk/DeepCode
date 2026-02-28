@@ -8,10 +8,17 @@
 
 import { useCallback, useEffect } from 'react';
 import { useBlocker } from 'react-router-dom';
+import { shallow } from 'zustand/shallow';
 import { useWorkflowStore } from '../stores/workflowStore';
 
 export function useNavigationGuard() {
-  const { status, isWaitingForInput } = useWorkflowStore();
+  const { status, isWaitingForInput } = useWorkflowStore(
+    (s) => ({
+      status: s.status,
+      isWaitingForInput: s.isWaitingForInput,
+    }),
+    shallow
+  );
   const shouldBlock = status === 'running' || isWaitingForInput === true;
   const blocker = useBlocker(shouldBlock);
 

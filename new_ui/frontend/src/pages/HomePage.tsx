@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom';
-import { motion } from 'framer-motion';
+import { m } from 'framer-motion';
 import {
   FileText,
   MessageSquare,
@@ -75,7 +75,7 @@ export default function HomePage() {
   return (
     <div className="space-y-12">
       {/* Hero */}
-      <motion.div
+      <m.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         className="text-center"
@@ -90,14 +90,14 @@ export default function HomePage() {
           Transform research papers and natural language specifications into
           production-ready code with AI-powered automation.
         </p>
-      </motion.div>
+      </m.div>
 
       {/* Quick Actions */}
       <div className="grid gap-6 md:grid-cols-3">
         {actions.map((action, index) => {
           const Icon = action.icon;
           return (
-            <motion.div
+            <m.div
               key={action.path}
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
@@ -122,7 +122,7 @@ export default function HomePage() {
                   </span>
                 </Card>
               </Link>
-            </motion.div>
+            </m.div>
           );
         })}
       </div>
@@ -136,7 +136,7 @@ export default function HomePage() {
           {features.map((feature, index) => {
             const Icon = feature.icon;
             return (
-              <motion.div
+              <m.div
                 key={feature.title}
                 initial={{ opacity: 0, scale: 0.95 }}
                 animate={{ opacity: 1, scale: 1 }}
@@ -153,7 +153,7 @@ export default function HomePage() {
                   </h3>
                   <p className="text-sm text-gray-500">{feature.description}</p>
                 </Card>
-              </motion.div>
+              </m.div>
             );
           })}
         </div>

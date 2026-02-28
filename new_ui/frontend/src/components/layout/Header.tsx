@@ -1,6 +1,7 @@
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { Settings, Menu, Loader2 } from 'lucide-react';
 import { useState } from 'react';
+import { shallow } from 'zustand/shallow';
 import { useWorkflowStore } from '../../stores/workflowStore';
 
 export default function Header() {
@@ -8,7 +9,14 @@ export default function Header() {
   const navigate = useNavigate();
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
-  const { status, workflowType, progress } = useWorkflowStore();
+  const { status, workflowType, progress } = useWorkflowStore(
+    (s) => ({
+      status: s.status,
+      workflowType: s.workflowType,
+      progress: s.progress,
+    }),
+    shallow
+  );
   const isRunning = status === 'running';
 
   const navItems = [

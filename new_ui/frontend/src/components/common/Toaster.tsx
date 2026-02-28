@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { X, CheckCircle, AlertCircle, Info, AlertTriangle } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { AnimatePresence, m } from 'framer-motion';
 
 interface Toast {
   id: string;
@@ -85,7 +85,7 @@ export function Toaster() {
         {currentToasts.map((t) => {
           const Icon = icons[t.type];
           return (
-            <motion.div
+            <m.div
               key={t.id}
               initial={{ opacity: 0, y: 20, scale: 0.95 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
@@ -105,7 +105,7 @@ export function Toaster() {
               >
                 <X className="h-4 w-4" />
               </button>
-            </motion.div>
+            </m.div>
           );
         })}
       </AnimatePresence>

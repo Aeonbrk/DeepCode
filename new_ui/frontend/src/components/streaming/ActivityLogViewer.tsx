@@ -5,8 +5,8 @@
  * Shows progress messages, timestamps, and status icons.
  */
 
-import { useEffect, useRef } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { m } from 'framer-motion';
 import {
   Terminal,
   CheckCircle,
@@ -34,6 +34,8 @@ interface ActivityLogViewerProps {
   isRunning: boolean;
   currentMessage?: string;
 }
+
+const DEFAULT_VISIBLE_EVENTS = 200;
 
 // Map message content to appropriate icon
 function getIconForMessage(message: string): React.ReactNode {
@@ -68,12 +70,10 @@ function getIconForMessage(message: string): React.ReactNode {
 }
 
 function formatTime(date: Date): string {
-  return date.toLocaleTimeString('en-US', {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false
-  });
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const seconds = String(date.getSeconds()).padStart(2, '0');
+  return `${hours}:${minutes}:${seconds}`;
 }
 
 export default function ActivityLogViewer({
@@ -82,13 +82,27 @@ export default function ActivityLogViewer({
   currentMessage,
 }: ActivityLogViewerProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [autoScroll, setAutoScroll] = useState(true);
+  const [showAll, setShowAll] = useState(false);
+
+  const visibleLogs = useMemo(() => {
+    if (showAll || logs.length <= DEFAULT_VISIBLE_EVENTS) {
+      return logs;
+    }
+    return logs.slice(-DEFAULT_VISIBLE_EVENTS);
+  }, [logs, showAll]);
+
+  const hiddenCount = logs.length - visibleLogs.length;
 
   // Auto-scroll to bottom when new logs arrive
   useEffect(() => {
+    if (!autoScroll) {
+      return;
+    }
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [logs]);
+  }, [visibleLogs, autoScroll]);
 
   return (
     <div className="rounded-xl border border-gray-200 bg-gray-900 overflow-hidden">
@@ -100,19 +114,32 @@ export default function ActivityLogViewer({
             Activity Log
           </span>
           {isRunning && (
-            <motion.span
+            <m.span
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               className="flex items-center text-xs text-green-400"
             >
               <Loader2 className="h-3 w-3 mr-1 animate-spin" />
               Live
-            </motion.span>
+            </m.span>
           )}
         </div>
 
-        <div className="text-xs text-gray-500">
-          {logs.length} events
+        <div className="flex items-center space-x-3">
+          <div className="text-xs text-gray-500">
+            {logs.length} events
+            {hiddenCount > 0 && !showAll ? ` (last ${DEFAULT_VISIBLE_EVENTS})` : ''}
+          </div>
+          {hiddenCount > 0 && (
+            <button
+              type="button"
+              onClick={() => setShowAll((v) => !v)}
+              className="text-xs text-gray-400 hover:text-gray-200 transition-colors"
+              title={showAll ? `Show last ${DEFAULT_VISIBLE_EVENTS}` : 'Show all events'}
+            >
+              {showAll ? `Show last ${DEFAULT_VISIBLE_EVENTS}` : 'Show all'}
+            </button>
+          )}
         </div>
       </div>
 
@@ -120,8 +147,13 @@ export default function ActivityLogViewer({
       <div
         ref={scrollRef}
         className="h-[350px] overflow-y-auto p-4 font-mono text-sm"
+        onScroll={(e) => {
+          const target = e.target as HTMLDivElement;
+          const distanceToBottom = target.scrollHeight - target.scrollTop - target.clientHeight;
+          setAutoScroll(distanceToBottom < 40);
+        }}
       >
-        {logs.length === 0 && !isRunning ? (
+        {visibleLogs.length === 0 && !isRunning ? (
           <div className="h-full flex items-center justify-center text-gray-500">
             <div className="text-center">
               <Terminal className="h-12 w-12 mx-auto mb-3 opacity-50" />
@@ -130,40 +162,29 @@ export default function ActivityLogViewer({
             </div>
           </div>
         ) : (
-          <AnimatePresence mode="popLayout">
-            {logs.map((log) => (
-              <motion.div
+          <>
+            {visibleLogs.map((log) => (
+              <div
                 key={log.id}
-                initial={{ opacity: 0, x: -20 }}
-                animate={{ opacity: 1, x: 0 }}
-                transition={{ duration: 0.2 }}
                 className="flex items-start space-x-3 py-2 border-b border-gray-800 last:border-0"
               >
-                {/* Timestamp */}
                 <span className="text-gray-500 text-xs whitespace-nowrap pt-0.5">
                   {formatTime(log.timestamp)}
                 </span>
-
-                {/* Icon */}
                 <span className="flex-shrink-0 pt-0.5">
                   {getIconForMessage(log.message)}
                 </span>
-
-                {/* Message */}
                 <span className="text-gray-300 flex-1 break-words">
                   {log.message}
                 </span>
-
-                {/* Progress Badge */}
                 <span className="text-xs text-gray-500 whitespace-nowrap pt-0.5">
                   {log.progress}%
                 </span>
-              </motion.div>
+              </div>
             ))}
 
-            {/* Current Activity Indicator */}
             {isRunning && currentMessage && (
-              <motion.div
+              <m.div
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 className="flex items-start space-x-3 py-2 bg-gray-800/50 rounded-lg mt-2 px-2"
@@ -175,9 +196,9 @@ export default function ActivityLogViewer({
                 <span className="text-green-400 flex-1">
                   {currentMessage}
                 </span>
-              </motion.div>
+              </m.div>
             )}
-          </AnimatePresence>
+          </>
         )}
       </div>
 

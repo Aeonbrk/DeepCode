@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { motion } from 'framer-motion';
+import { m } from 'framer-motion';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Card, Button } from '../components/common';
 import { toast } from '../components/common/Toaster';
@@ -71,7 +71,7 @@ export default function SettingsPage() {
   return (
     <div className="space-y-6 max-w-2xl">
       {/* Header */}
-      <motion.div
+      <m.div
         initial={{ opacity: 0, y: -10 }}
         animate={{ opacity: 1, y: 0 }}
       >
@@ -79,7 +79,7 @@ export default function SettingsPage() {
         <p className="text-gray-500 mt-1">
           Configure DeepCode to match your preferences
         </p>
-      </motion.div>
+      </m.div>
 
       {/* LLM Provider */}
       <Card>

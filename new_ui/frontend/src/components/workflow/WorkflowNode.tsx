@@ -1,7 +1,7 @@
 import { memo } from 'react';
 import { Handle, Position, NodeProps } from 'reactflow';
 import { CheckCircle, Circle, Loader2 } from 'lucide-react';
-import { motion } from 'framer-motion';
+import { m } from 'framer-motion';
 
 interface WorkflowNodeData {
   id: string;
@@ -23,7 +23,7 @@ function WorkflowNode({ data }: NodeProps<WorkflowNodeData>) {
         className="!bg-gray-300 !border-2 !border-white !w-3 !h-3"
       />
 
-      <motion.div
+      <m.div
         initial={{ scale: 0.9, opacity: 0 }}
         animate={{ scale: 1, opacity: 1 }}
         onClick={onClick}
@@ -68,14 +68,14 @@ function WorkflowNode({ data }: NodeProps<WorkflowNodeData>) {
         </p>
 
         {isActive && (
-          <motion.div
+          <m.div
             layoutId="activeIndicator"
             className="absolute -bottom-1 left-1/2 transform -translate-x-1/2 w-2 h-2 bg-primary-500 rounded-full"
             animate={{ scale: [1, 1.2, 1] }}
             transition={{ repeat: Infinity, duration: 1.5 }}
           />
         )}
-      </motion.div>
+      </m.div>
 
       <Handle
         type="source"

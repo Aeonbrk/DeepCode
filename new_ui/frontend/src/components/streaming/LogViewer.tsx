@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { AnimatePresence, m } from 'framer-motion';
 import { Terminal, Trash2, Filter } from 'lucide-react';
 
 interface LogEntry {
@@ -117,7 +117,7 @@ export default function LogViewer({
           <div className="p-2 space-y-1">
             <AnimatePresence initial={false}>
               {filteredLogs.map((log) => (
-                <motion.div
+                <m.div
                   key={log.id}
                   initial={{ opacity: 0, height: 0 }}
                   animate={{ opacity: 1, height: 'auto' }}
@@ -140,7 +140,7 @@ export default function LogViewer({
                     </span>
                   )}
                   <span className="text-gray-700 break-all">{log.message}</span>
-                </motion.div>
+                </m.div>
               ))}
             </AnimatePresence>
           </div>

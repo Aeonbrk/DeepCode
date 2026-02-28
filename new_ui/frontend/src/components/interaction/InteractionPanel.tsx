@@ -8,7 +8,8 @@
  */
 
 import { useState, useCallback } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { AnimatePresence, m } from 'framer-motion';
+import { shallow } from 'zustand/shallow';
 import {
   MessageCircle,
   Send,
@@ -39,7 +40,13 @@ export default function InteractionPanel({
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [feedback, setFeedback] = useState('');
   const [showModify, setShowModify] = useState(false);
-  const { clearInteraction, addActivityLog } = useWorkflowStore();
+  const { clearInteraction, addActivityLog } = useWorkflowStore(
+    (s) => ({
+      clearInteraction: s.clearInteraction,
+      addActivityLog: s.addActivityLog,
+    }),
+    shallow
+  );
 
   const handleSubmit = useCallback(async (action: string, data: Record<string, unknown> = {}) => {
     setIsSubmitting(true);
@@ -89,7 +96,7 @@ export default function InteractionPanel({
     return (
       <div className="space-y-4">
         {questions.map((q, index) => (
-          <motion.div
+          <m.div
             key={q.id || index}
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
@@ -121,7 +128,7 @@ export default function InteractionPanel({
                 />
               </div>
             </div>
-          </motion.div>
+          </m.div>
         ))}
 
         <div className="flex justify-end space-x-3 pt-4 border-t border-gray-100">
@@ -165,7 +172,7 @@ export default function InteractionPanel({
 
         <AnimatePresence>
           {showModify && (
-            <motion.div
+            <m.div
               initial={{ opacity: 0, height: 0 }}
               animate={{ opacity: 1, height: 'auto' }}
               exit={{ opacity: 0, height: 0 }}
@@ -178,7 +185,7 @@ export default function InteractionPanel({
                 onChange={(e) => setFeedback(e.target.value)}
                 disabled={isSubmitting}
               />
-            </motion.div>
+            </m.div>
           )}
         </AnimatePresence>
 
@@ -259,8 +266,11 @@ export default function InteractionPanel({
     );
   };
 
+  // Compute once per render instead of invoking in JSX.
+  const content = renderContent();
+
   return (
-    <motion.div
+    <m.div
       initial={{ opacity: 0, scale: 0.95 }}
       animate={{ opacity: 1, scale: 1 }}
       exit={{ opacity: 0, scale: 0.95 }}
@@ -276,8 +286,8 @@ export default function InteractionPanel({
           </div>
         </div>
 
-        {renderContent()}
+        {content}
       </Card>
-    </motion.div>
+    </m.div>
   );
 }

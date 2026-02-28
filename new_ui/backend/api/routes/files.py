@@ -3,8 +3,8 @@ Files API Routes
 Handles file upload and download operations
 """
 
+import asyncio
 import uuid
-import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, File, UploadFile, HTTPException
@@ -19,6 +19,26 @@ router = APIRouter()
 _file_registry: dict = {}
 
 
+class UploadTooLargeError(Exception):
+    pass
+
+
+def _write_upload_file(
+    source_file, destination: Path, *, max_size: int, chunk_size: int = 1024 * 1024
+) -> int:
+    bytes_written = 0
+    with open(destination, "wb") as buffer:
+        while True:
+            chunk = source_file.read(chunk_size)
+            if not chunk:
+                break
+            bytes_written += len(chunk)
+            if bytes_written > max_size:
+                raise UploadTooLargeError()
+            buffer.write(chunk)
+    return bytes_written
+
+
 @router.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     """Upload a file (PDF, markdown, etc.)"""
@@ -29,7 +49,10 @@ async def upload_file(file: UploadFile = File(...)):
     if file_ext not in allowed_types:
         raise HTTPException(
             status_code=400,
-            detail=f"File type '{file_ext}' not allowed. Allowed: {', '.join(allowed_types)}",
+            detail=(
+                f"File type '{file_ext}' not allowed. Allowed: "
+                f"{', '.join(sorted(allowed_types))}"
+            ),
         )
 
     # Generate unique file ID
@@ -37,31 +60,34 @@ async def upload_file(file: UploadFile = File(...)):
     safe_filename = f"{file_id}{file_ext}"
     file_path = Path(settings.upload_dir) / safe_filename
 
+    bytes_written = 0
     try:
         # Ensure upload directory exists
         file_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Save file
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        # Get file size
-        file_size = file_path.stat().st_size
-
-        # Check size limit
-        if file_size > settings.max_upload_size:
-            file_path.unlink()  # Delete oversized file
+        try:
+            bytes_written = await asyncio.to_thread(
+                _write_upload_file,
+                file.file,
+                file_path,
+                max_size=settings.max_upload_size,
+            )
+        except UploadTooLargeError as exc:
             raise HTTPException(
                 status_code=400,
-                detail=f"File size exceeds limit of {settings.max_upload_size // (1024*1024)}MB",
-            )
+                detail=(
+                    "File size exceeds limit of "
+                    f"{settings.max_upload_size // (1024 * 1024)}MB"
+                ),
+            ) from exc
 
         # Register file
         _file_registry[file_id] = {
             "id": file_id,
             "original_name": file.filename,
             "path": str(file_path),
-            "size": file_size,
+            "size": bytes_written,
             "type": file_ext,
         }
 
@@ -69,16 +95,20 @@ async def upload_file(file: UploadFile = File(...)):
             "file_id": file_id,
             "filename": file.filename,
             "path": str(file_path),
-            "size": file_size,
+            "size": bytes_written,
         }
 
     except HTTPException:
+        file_path.unlink(missing_ok=True)
         raise
     except Exception as e:
+        file_path.unlink(missing_ok=True)
         raise HTTPException(
             status_code=500,
             detail=f"Failed to upload file: {str(e)}",
         )
+    finally:
+        await file.close()
 
 
 @router.get("/download/{file_id}")
