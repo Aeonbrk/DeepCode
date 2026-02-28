@@ -25,6 +25,7 @@ def _get_deepcode_url() -> str:
 _MAX_RETRIES = 2
 _BASE_RETRY_DELAY_SECONDS = 0.5
 _TRANSIENT_STATUS_CODES = {502, 503, 504}
+_IDEMPOTENT_HTTP_METHODS = {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
 
 _SHARED_CLIENTS: dict[str, httpx.AsyncClient] = {}
 
@@ -66,6 +67,14 @@ def _format_http_status_error(e: httpx.HTTPStatusError) -> str:
     return f"Error: DeepCode API returned status {e.response.status_code}."
 
 
+def _request_outcome_unknown_message(action: str) -> str:
+    return (
+        f"Error: Network failure while trying to {action}. "
+        "The request outcome is unknown (it may have succeeded server-side). "
+        "Use deepcode_list_tasks or deepcode_status to confirm current state."
+    )
+
+
 async def _request_with_retries(
     client: httpx.AsyncClient,
     method: str,
@@ -75,11 +84,13 @@ async def _request_with_retries(
     params: dict[str, Any] | None = None,
     timeout: float | httpx.Timeout | None = None,
 ) -> httpx.Response:
+    method_upper = method.upper()
+    can_retry = method_upper in _IDEMPOTENT_HTTP_METHODS
     delay = _BASE_RETRY_DELAY_SECONDS
     for attempt in range(_MAX_RETRIES + 1):
         try:
             response = await client.request(
-                method,
+                method_upper,
                 url,
                 json=json,
                 params=params,
@@ -90,6 +101,7 @@ async def _request_with_retries(
         except httpx.HTTPStatusError as e:
             if (
                 e.response.status_code in _TRANSIENT_STATUS_CODES
+                and can_retry
                 and attempt < _MAX_RETRIES
             ):
                 await asyncio.sleep(delay)
@@ -97,7 +109,7 @@ async def _request_with_retries(
                 continue
             raise
         except httpx.RequestError:
-            if attempt < _MAX_RETRIES:
+            if can_retry and attempt < _MAX_RETRIES:
                 await asyncio.sleep(delay)
                 delay *= 2
                 continue
@@ -206,6 +218,8 @@ class DeepCodePaper2CodeTool(_DeepCodeToolBase):
             )
         except httpx.ConnectError:
             return "Error: Cannot connect to DeepCode backend. Is the DeepCode service running?"
+        except httpx.RequestError:
+            return _request_outcome_unknown_message("submit paper-to-code task")
         except httpx.HTTPStatusError as e:
             return _format_http_status_error(e)
         except Exception as e:
@@ -274,6 +288,8 @@ class DeepCodeChat2CodeTool(_DeepCodeToolBase):
             )
         except httpx.ConnectError:
             return "Error: Cannot connect to DeepCode backend. Is the DeepCode service running?"
+        except httpx.RequestError:
+            return _request_outcome_unknown_message("submit chat-to-code task")
         except httpx.HTTPStatusError as e:
             return _format_http_status_error(e)
         except Exception as e:
@@ -480,6 +496,8 @@ class DeepCodeCancelTool(_DeepCodeToolBase):
             return f"Task '{task_id}' has been cancelled successfully."
         except httpx.ConnectError:
             return "Error: Cannot connect to DeepCode backend. Is the DeepCode service running?"
+        except httpx.RequestError:
+            return _request_outcome_unknown_message(f"cancel task '{task_id}'")
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 400:
                 return f"Error: Task '{task_id}' not found or cannot be cancelled."
@@ -559,6 +577,10 @@ class DeepCodeRespondTool(_DeepCodeToolBase):
             )
         except httpx.ConnectError:
             return "Error: Cannot connect to DeepCode backend. Is the DeepCode service running?"
+        except httpx.RequestError:
+            return _request_outcome_unknown_message(
+                f"submit interaction response for task '{task_id}'"
+            )
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 400:
                 detail = _try_get_error_detail(e.response)

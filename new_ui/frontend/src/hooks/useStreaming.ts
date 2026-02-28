@@ -126,8 +126,13 @@ export function useStreaming(taskId: string | null) {
           break;
 
         case 'error':
+          {
+          const errorText = typeof message.error === 'string' ? message.error : '';
           // Handle "Task not found" - clear state and stop reconnecting
-          if (message.error === 'Task not found') {
+          if (
+            message.code?.toUpperCase() === 'TASK_NOT_FOUND'
+            || errorText.toLowerCase().includes('task not found')
+          ) {
             if (isDev) {
               console.log('[useStreaming] Task not found, clearing persisted state...');
             }
@@ -136,11 +141,12 @@ export function useStreaming(taskId: string | null) {
           } else {
             // Real error - mark as error state
             setStatus('error');  // This will make isFinished = true
-            setError(message.error);
+            setError(errorText || 'Workflow failed with an unknown error');
             clearInteraction(); // Clear any pending interaction
-            addActivityLog(`❌ Error: ${message.error}`, 0, 'error');
+            addActivityLog(`❌ Error: ${errorText || 'Unknown error'}`, 0, 'error');
           }
           break;
+          }
 
         case 'cancelled':
           setStatus('cancelled');

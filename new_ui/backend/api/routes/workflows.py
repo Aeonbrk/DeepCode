@@ -18,6 +18,14 @@ from models.responses import TaskResponse
 router = APIRouter()
 
 
+def _task_not_found_error() -> HTTPException:
+    return HTTPException(
+        status_code=404,
+        detail="Task not found",
+        headers={"X-Error-Code": "TASK_NOT_FOUND"},
+    )
+
+
 @router.post("/paper-to-code", response_model=TaskResponse)
 async def start_paper_to_code(
     request: PaperToCodeRequest,
@@ -77,7 +85,7 @@ async def get_workflow_status(task_id: str):
     task = workflow_service.get_task(task_id)
 
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise _task_not_found_error()
 
     response = {
         "task_id": task.task_id,
@@ -123,7 +131,7 @@ async def respond_to_interaction(task_id: str, request: InteractionResponseReque
     task = workflow_service.get_task(task_id)
 
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise _task_not_found_error()
 
     if task.status != "waiting_for_input":
         raise HTTPException(
@@ -166,7 +174,7 @@ async def get_pending_interaction(task_id: str):
     task = workflow_service.get_task(task_id)
 
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise _task_not_found_error()
 
     if task.status != "waiting_for_input" or not task.pending_interaction:
         return {

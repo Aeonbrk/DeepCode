@@ -9,7 +9,10 @@ Specialized in executing LLM-generated shell commands to create file tree struct
 import asyncio
 import os
 import re
+import selectors
+import signal
 import subprocess
+import time
 from pathlib import Path
 from typing import List, Dict
 from mcp.server.models import InitializationOptions
@@ -20,7 +23,26 @@ import mcp.server.stdio
 # 创建MCP服务器实例 / Create MCP server instance
 app = Server("command-executor")
 
-_MAX_OUTPUT_CHARS = int(os.environ.get("DEEPCODE_SHELL_MAX_OUTPUT_CHARS", "20000"))
+
+def _get_env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if value < minimum:
+        return default
+    return value
+
+
+_MAX_OUTPUT_CHARS = _get_env_int("DEEPCODE_SHELL_MAX_OUTPUT_CHARS", 20000, minimum=1000)
+_MAX_CAPTURE_BYTES = _get_env_int(
+    "DEEPCODE_SHELL_MAX_CAPTURE_BYTES",
+    _MAX_OUTPUT_CHARS * 8,
+    minimum=4096,
+)
 _REDACTION_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"(?i)\bAuthorization:\s*Bearer\s+[^\s]+"), "Authorization: Bearer ***"),
     (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9\-_\.=:+/]{10,}"), "Bearer ***"),
@@ -61,6 +83,115 @@ def _sanitize_output(value: str) -> str:
     if not value:
         return ""
     return _truncate_text(_redact_text(value), _MAX_OUTPUT_CHARS)
+
+
+def _append_capped_chunk(buffer: bytearray, chunk: bytes, limit_bytes: int) -> bool:
+    if len(buffer) >= limit_bytes:
+        return True
+    remaining = limit_bytes - len(buffer)
+    if len(chunk) > remaining:
+        buffer.extend(chunk[:remaining])
+        return True
+    buffer.extend(chunk)
+    return False
+
+
+def _decode_output(buffer: bytearray, *, truncated: bool) -> str:
+    data = bytes(buffer)
+    text = data.decode("utf-8", errors="replace")
+    if truncated:
+        text += "\n... (output truncated at capture limit)\n"
+    return text
+
+
+def _run_command_capped_output(
+    command: str, working_directory: str, timeout_seconds: int
+) -> subprocess.CompletedProcess[str]:
+    def _terminate_process_tree(process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except Exception:
+            process.kill()
+
+    process = subprocess.Popen(
+        command,
+        shell=True,
+        cwd=working_directory,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + timeout_seconds
+    output_limit_hit = False
+    stdout_truncated = False
+    stderr_truncated = False
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    selector = selectors.DefaultSelector()
+
+    if process.stdout is not None:
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    if process.stderr is not None:
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_process_tree(process)
+                process.wait(timeout=1)
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
+
+            events = selector.select(timeout=min(0.1, remaining))
+            if not events:
+                continue
+
+            for key, _ in events:
+                stream = key.fileobj
+                chunk = stream.read1(65536) if hasattr(stream, "read1") else stream.read(65536)
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+
+                if key.data == "stdout":
+                    stdout_truncated = (
+                        _append_capped_chunk(stdout_buffer, chunk, _MAX_CAPTURE_BYTES)
+                        or stdout_truncated
+                    )
+                else:
+                    stderr_truncated = (
+                        _append_capped_chunk(stderr_buffer, chunk, _MAX_CAPTURE_BYTES)
+                        or stderr_truncated
+                    )
+
+                if (stdout_truncated or stderr_truncated) and not output_limit_hit:
+                    output_limit_hit = True
+                    _terminate_process_tree(process)
+    finally:
+        selector.close()
+
+    try:
+        result_code = process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(process)
+        result_code = process.wait(timeout=1)
+
+    stdout_text = _decode_output(stdout_buffer, truncated=stdout_truncated)
+    stderr_text = _decode_output(stderr_buffer, truncated=stderr_truncated)
+    if output_limit_hit:
+        stderr_text += "\n... (process killed after output limit exceeded)\n"
+
+    return subprocess.CompletedProcess(
+        args=command,
+        returncode=result_code if result_code is not None else 1,
+        stdout=stdout_text,
+        stderr=stderr_text,
+    )
 
 
 @app.list_tools()
@@ -195,13 +326,10 @@ async def execute_command_batch(
                 display_command = _redact_text(command)
                 # 执行命令 / Execute command
                 result = await asyncio.to_thread(
-                    subprocess.run,
+                    _run_command_capped_output,
                     command,
-                    shell=True,
-                    cwd=working_directory,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,  # 30秒超时
+                    working_directory,
+                    30,
                 )
 
                 if result.returncode == 0:
@@ -262,13 +390,10 @@ async def execute_single_command(
 
         # 执行命令 / Execute command
         result = await asyncio.to_thread(
-            subprocess.run,
+            _run_command_capped_output,
             command,
-            shell=True,
-            cwd=working_directory,
-            capture_output=True,
-            text=True,
-            timeout=30,
+            working_directory,
+            30,
         )
 
         # 格式化输出 / Format output

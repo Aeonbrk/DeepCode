@@ -37,17 +37,25 @@ def _get_newest_log_file(logs_dir: Path) -> Path | None:
 def _get_session_log_file(
     logs_dir: Path, session_id: str, *, strict_session: bool
 ) -> Path | None:
+    session = (session_id or "").strip()
+    if not session:
+        if strict_session:
+            return None
+        return _get_newest_log_file(logs_dir)
+
+    exact = logs_dir / f"{session}.jsonl"
+    if session and exact.exists():
+        return exact
+
+    if strict_session:
+        return None
+
     try:
         candidates = list(logs_dir.glob("*.jsonl"))
     except Exception:
         return None
     if not candidates:
         return None
-
-    session = (session_id or "").strip()
-    exact = logs_dir / f"{session}.jsonl"
-    if session and exact.exists():
-        return exact
 
     matching = [path for path in candidates if session and session in path.name]
     if matching:
@@ -56,8 +64,6 @@ def _get_session_log_file(
         except Exception:
             return matching[-1]
 
-    if strict_session:
-        return None
     return _get_newest_log_file(logs_dir)
 
 
@@ -111,11 +117,13 @@ async def logs_websocket(websocket: WebSocket, session_id: str):
         allowed_origins=settings.cors_origins,
         debug=settings.debug,
         env=settings.env,
+        allow_missing_origin=settings.allow_ws_without_origin,
     ):
         await websocket.accept()
         await websocket.send_json(
             {
                 "type": "error",
+                "code": "WS_ORIGIN_NOT_ALLOWED",
                 "message": "WebSocket origin not allowed",
                 "timestamp": datetime.utcnow().isoformat(),
             }
@@ -128,6 +136,7 @@ async def logs_websocket(websocket: WebSocket, session_id: str):
         await websocket.send_json(
             {
                 "type": "error",
+                "code": "LOG_STREAMING_DISABLED",
                 "message": "Log streaming is disabled on this server",
                 "timestamp": datetime.utcnow().isoformat(),
             }
@@ -142,13 +151,15 @@ async def logs_websocket(websocket: WebSocket, session_id: str):
     current_log_file = None
     last_scan_ts = 0.0
     strict_session = settings.strict_logs_ws_session
+    strict_missing_since: float | None = None
+    strict_wait_seconds = max(1.0, float(settings.strict_logs_ws_wait_seconds))
 
     try:
         while True:
             try:
                 # Find the most recent log file
+                now_ts = asyncio.get_running_loop().time()
                 if logs_dir.exists():
-                    now_ts = asyncio.get_running_loop().time()
                     if current_log_file is None or (now_ts - last_scan_ts) >= LOG_DIR_SCAN_INTERVAL_S:
                         last_scan_ts = now_ts
                         newest_log = await asyncio.to_thread(
@@ -157,62 +168,102 @@ async def logs_websocket(websocket: WebSocket, session_id: str):
                             session_id,
                             strict_session=strict_session,
                         )
-                        if newest_log and newest_log != current_log_file:
-                            current_log_file = newest_log
-                            last_position = 0
-
-                    if current_log_file:
-                        try:
-                            new_lines, last_position = await asyncio.to_thread(
-                                _read_new_log_lines,
-                                current_log_file,
-                                last_position,
-                                max_lines=MAX_LOG_LINES_PER_TICK,
-                            )
-
-                            for raw_line in new_lines:
-                                line = raw_line.strip()
-                                if not line:
-                                    continue
-
-                                try:
-                                    log_entry = json.loads(line)
+                        if newest_log is not None:
+                            strict_missing_since = None
+                            if newest_log != current_log_file:
+                                current_log_file = newest_log
+                                last_position = 0
+                        else:
+                            current_log_file = None
+                            if strict_session:
+                                if strict_missing_since is None:
+                                    strict_missing_since = now_ts
+                                elif (
+                                    now_ts - strict_missing_since
+                                ) >= strict_wait_seconds:
                                     await websocket.send_json(
                                         {
-                                            "type": "log",
-                                            "level": log_entry.get("level", "INFO"),
-                                            "message": redact_text(
-                                                str(log_entry.get("message", ""))
+                                            "type": "error",
+                                            "code": "SESSION_LOG_NOT_FOUND",
+                                            "message": (
+                                                f"No log stream found for session '{session_id}'"
                                             ),
-                                            "namespace": log_entry.get("namespace", ""),
-                                            "timestamp": log_entry.get(
-                                                "timestamp",
-                                                datetime.utcnow().isoformat(),
-                                            ),
-                                        }
-                                    )
-                                except json.JSONDecodeError:
-                                    # Raw text log
-                                    await websocket.send_json(
-                                        {
-                                            "type": "log",
-                                            "level": "INFO",
-                                            "message": redact_text(line),
-                                            "namespace": "",
                                             "timestamp": datetime.utcnow().isoformat(),
                                         }
                                     )
+                                    await websocket.close(code=1008)
+                                    return
+                            else:
+                                strict_missing_since = None
+                elif strict_session:
+                    if strict_missing_since is None:
+                        strict_missing_since = now_ts
+                    elif (now_ts - strict_missing_since) >= strict_wait_seconds:
+                        await websocket.send_json(
+                            {
+                                "type": "error",
+                                "code": "SESSION_LOG_NOT_FOUND",
+                                "message": (
+                                    f"No log stream found for session '{session_id}'"
+                                ),
+                                "timestamp": datetime.utcnow().isoformat(),
+                            }
+                        )
+                        await websocket.close(code=1008)
+                        return
 
-                        except Exception as e:
-                            await websocket.send_json(
-                                {
-                                    "type": "error",
-                                    "message": redact_text(
-                                        f"Error reading log file: {str(e)}"
-                                    ),
-                                    "timestamp": datetime.utcnow().isoformat(),
-                                }
-                            )
+                if current_log_file:
+                    try:
+                        new_lines, last_position = await asyncio.to_thread(
+                            _read_new_log_lines,
+                            current_log_file,
+                            last_position,
+                            max_lines=MAX_LOG_LINES_PER_TICK,
+                        )
+
+                        for raw_line in new_lines:
+                            line = raw_line.strip()
+                            if not line:
+                                continue
+
+                            try:
+                                log_entry = json.loads(line)
+                                await websocket.send_json(
+                                    {
+                                        "type": "log",
+                                        "level": log_entry.get("level", "INFO"),
+                                        "message": redact_text(
+                                            str(log_entry.get("message", ""))
+                                        ),
+                                        "namespace": log_entry.get("namespace", ""),
+                                        "timestamp": log_entry.get(
+                                            "timestamp",
+                                            datetime.utcnow().isoformat(),
+                                        ),
+                                    }
+                                )
+                            except json.JSONDecodeError:
+                                # Raw text log
+                                await websocket.send_json(
+                                    {
+                                        "type": "log",
+                                        "level": "INFO",
+                                        "message": redact_text(line),
+                                        "namespace": "",
+                                        "timestamp": datetime.utcnow().isoformat(),
+                                    }
+                                )
+
+                    except Exception as e:
+                        await websocket.send_json(
+                            {
+                                "type": "error",
+                                "message": redact_text(
+                                    f"Error reading log file: {str(e)}"
+                                ),
+                                "timestamp": datetime.utcnow().isoformat(),
+                            }
+                        )
 
                 # Wait before checking for more logs
                 await asyncio.sleep(LOG_POLL_INTERVAL_S)

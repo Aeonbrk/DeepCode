@@ -37,12 +37,14 @@ async def code_stream_websocket(websocket: WebSocket, task_id: str):
         allowed_origins=settings.cors_origins,
         debug=settings.debug,
         env=settings.env,
+        allow_missing_origin=settings.allow_ws_without_origin,
     ):
         await websocket.accept()
         await websocket.send_json(
             {
                 "type": "error",
                 "task_id": task_id,
+                "code": "WS_ORIGIN_NOT_ALLOWED",
                 "error": "WebSocket origin not allowed",
                 "timestamp": datetime.utcnow().isoformat(),
             }
@@ -53,20 +55,23 @@ async def code_stream_websocket(websocket: WebSocket, task_id: str):
     await websocket.accept()
 
     task = workflow_service.get_task(task_id)
-    # Subscribe to get our own queue for this task
-    queue = workflow_service.subscribe(task_id)
+    queue = None
 
     if not task:
         await websocket.send_json(
             {
                 "type": "error",
                 "task_id": task_id,
+                "code": "TASK_NOT_FOUND",
                 "error": "Task not found",
                 "timestamp": datetime.utcnow().isoformat(),
             }
         )
         await websocket.close()
         return
+
+    # Subscribe only after task existence is confirmed.
+    queue = workflow_service.subscribe(task_id)
 
     try:
         # Track current file being streamed

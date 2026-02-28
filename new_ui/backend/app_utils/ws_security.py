@@ -14,15 +14,17 @@ def is_ws_origin_allowed(
     allowed_origins: list[str],
     debug: bool,
     env: str,
+    allow_missing_origin: bool = False,
 ) -> bool:
     """
     Best-effort Origin allowlist.
 
     Notes:
     - Browsers always send Origin. Non-browser clients may not.
-    - In Docker mode, treat missing Origin as disallowed to reduce accidental exposure.
+    - Missing Origin is denied by default.
+    - Set `allow_missing_origin=True` only for trusted internal clients.
     """
+    _ = debug, env
     if origin is None:
-        return bool(debug) and env != "docker"
+        return allow_missing_origin
     return origin in allowed_origins
-

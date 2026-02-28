@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     enable_logs_ws: bool = False
     # When enabled, require ws/logs/{session_id} to map to a specific log file.
     strict_logs_ws_session: bool = True
+    # Grace period while waiting for strict session log file creation.
+    strict_logs_ws_wait_seconds: float = 30.0
+    # Browsers always send Origin; non-browser WS clients can opt in explicitly.
+    allow_ws_without_origin: bool = False
 
     class Config:
         env_prefix = "DEEPCODE_"

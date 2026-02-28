@@ -74,12 +74,14 @@ async def workflow_websocket(websocket: WebSocket, task_id: str):
         allowed_origins=settings.cors_origins,
         debug=settings.debug,
         env=settings.env,
+        allow_missing_origin=settings.allow_ws_without_origin,
     ):
         await websocket.accept()
         await websocket.send_json(
             {
                 "type": "error",
                 "task_id": task_id,
+                "code": "WS_ORIGIN_NOT_ALLOWED",
                 "error": redact_text("WebSocket origin not allowed"),
                 "timestamp": datetime.utcnow().isoformat(),
             }
@@ -96,6 +98,7 @@ async def workflow_websocket(websocket: WebSocket, task_id: str):
             {
                 "type": "error",
                 "task_id": task_id,
+                "code": "TASK_NOT_FOUND",
                 "error": redact_text("Task not found"),
                 "timestamp": datetime.utcnow().isoformat(),
             }
