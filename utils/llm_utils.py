@@ -91,7 +91,14 @@ def load_api_config(secrets_path: str = "mcp_agent.secrets.yaml") -> Dict[str, A
 
         openai_cfg = config.get("openai")
         if isinstance(openai_cfg, dict):
-            info = get_openai_base_url_info(openai_cfg.get("base_url"))
+            # Preserve the original value so workflows can detect whether the user
+            # intended an endpoint-style URL (e.g. ".../responses") even after we
+            # normalize `base_url` for the official SDK.
+            raw_base_url = openai_cfg.get("base_url")
+            if raw_base_url is not None and "base_url_raw" not in openai_cfg:
+                openai_cfg["base_url_raw"] = raw_base_url
+
+            info = get_openai_base_url_info(raw_base_url)
             openai_cfg["base_url"] = info.sdk_base_url
             # OpenAI's SDK cannot safely merge paths when query params live inside
             # `base_url` (httpx `raw_path` includes the query), so keep query in

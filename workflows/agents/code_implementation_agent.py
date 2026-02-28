@@ -113,6 +113,7 @@ class CodeImplementationAgent:
         self.memory_agent = None  # Will be set externally
         self.llm_client = None  # Will be set externally
         self.llm_client_type = None  # Will be set externally
+        self.openai_use_responses = False
 
         # Log read tools configuration
         read_tools_status = "ENABLED" if self.enable_read_tools else "DISABLED"
@@ -137,7 +138,13 @@ class CodeImplementationAgent:
         """
         return GENERAL_CODE_IMPLEMENTATION_SYSTEM_PROMPT
 
-    def set_memory_agent(self, memory_agent, llm_client=None, llm_client_type=None):
+    def set_memory_agent(
+        self,
+        memory_agent,
+        llm_client=None,
+        llm_client_type=None,
+        openai_use_responses: bool = False,
+    ):
         """
         Set memory agent for code summary generation
 
@@ -149,6 +156,7 @@ class CodeImplementationAgent:
         self.memory_agent = memory_agent
         self.llm_client = llm_client
         self.llm_client_type = llm_client_type
+        self.openai_use_responses = bool(openai_use_responses)
         self.logger.info("Memory agent integration configured")
 
     async def execute_tool_calls(self, tool_calls: List[Dict]) -> List[Dict]:
@@ -435,6 +443,7 @@ class CodeImplementationAgent:
                         file_path,
                         file_content,
                         self.get_files_implemented_count(),  # Pass the current file count
+                        use_openai_responses=self.openai_use_responses,
                     )
 
                     self.logger.info(

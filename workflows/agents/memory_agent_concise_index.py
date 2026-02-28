@@ -998,6 +998,7 @@ class ConciseMemoryAgent:
         file_path: str,
         implementation_content: str,
         files_implemented: int,
+        use_openai_responses: bool = False,
     ) -> str:
         """
         Create LLM-based code implementation summary after writing a file
@@ -1025,7 +1026,10 @@ class ConciseMemoryAgent:
 
             # Get LLM-generated summary
             llm_response = await self._call_llm_for_summary(
-                client, client_type, summary_messages
+                client,
+                client_type,
+                summary_messages,
+                use_openai_responses=use_openai_responses,
             )
             llm_summary = llm_response.get("content", "")
 
@@ -1361,7 +1365,11 @@ class ConciseMemoryAgent:
             self.logger.error(f"Failed to save code implementation summary: {e}")
 
     async def _call_llm_for_summary(
-        self, client, client_type: str, summary_messages: List[Dict]
+        self,
+        client,
+        client_type: str,
+        summary_messages: List[Dict],
+        use_openai_responses: bool = False,
     ) -> Dict[str, Any]:
         """
         Call LLM for code implementation summary generation ONLY
@@ -1389,12 +1397,51 @@ class ConciseMemoryAgent:
             return {"content": content}
 
         elif client_type == "openai":
-            openai_messages = [
-                {
-                    "role": "system",
-                    "content": "You are an expert code implementation summarizer. Create structured summaries of implemented code files that preserve essential information about functions, dependencies, and implementation approaches.",
-                }
-            ]
+            system_instruction = (
+                "You are an expert code implementation summarizer. Create structured summaries of implemented "
+                "code files that preserve essential information about functions, dependencies, and implementation "
+                "approaches."
+            )
+
+            if use_openai_responses:
+                from utils.mcp_agent_compat import _normalize_responses_result
+
+                input_items = []
+                for msg in summary_messages:
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    input_items.append(
+                        {"type": "message", "role": role, "content": str(content)}
+                    )
+
+                try:
+                    resp = await client.responses.create(
+                        model=self.default_models["openai"],
+                        instructions=system_instruction,
+                        input=input_items,
+                        max_output_tokens=5000,
+                        temperature=0.2,
+                    )
+                except Exception as e:
+                    # Some gateways reject optional sampling params; retry without them.
+                    err_text = str(e).lower()
+                    if "temperature" in err_text:
+                        resp = await client.responses.create(
+                            model=self.default_models["openai"],
+                            instructions=system_instruction,
+                            input=input_items,
+                            max_output_tokens=5000,
+                        )
+                    else:
+                        raise
+
+                normalized = _normalize_responses_result(resp)
+                content = self._extract_openai_responses_text(normalized)
+                if not content.strip():
+                    self.logger.warning("OpenAI Responses summary is empty or malformed")
+                return {"content": content}
+
+            openai_messages = [{"role": "system", "content": system_instruction}]
             openai_messages.extend(summary_messages)
 
             # Try max_tokens and temperature first, fallback to max_completion_tokens without temperature if unsupported
@@ -1419,9 +1466,9 @@ class ConciseMemoryAgent:
             # Safely extract content from response
             if response and hasattr(response, "choices") and response.choices:
                 return {"content": response.choices[0].message.content or ""}
-            else:
-                self.logger.warning("OpenAI response is empty or malformed")
-                return {"content": ""}
+
+            self.logger.warning("OpenAI response is empty or malformed")
+            return {"content": ""}
 
         elif client_type == "google":
             from google.genai import types
@@ -1683,10 +1730,10 @@ class ConciseMemoryAgent:
     def _read_code_knowledge_base(self) -> Optional[str]:
         """
         Read the implement_code_summary.md file as code knowledge base
-        Returns all content from the file
+        Returns only the latest implementation entry (hard-capped)
 
         Returns:
-            Full content of the file if it exists, None otherwise
+            Latest implementation entry if available, None otherwise
         """
         try:
             if os.path.exists(self.code_summary_path):
@@ -1694,8 +1741,15 @@ class ConciseMemoryAgent:
                     content = f.read().strip()
 
                 if content:
-                    # Return all content instead of just the latest entry
-                    return content
+                    latest_entry = self._extract_latest_implementation_entry(content)
+                    if not latest_entry:
+                        latest_entry = content
+
+                    max_chars = 8000
+                    if max_chars and len(latest_entry) > max_chars:
+                        return latest_entry[:max_chars] + "\n... (knowledge base truncated)"
+
+                    return latest_entry
                 else:
                     return None
             else:
@@ -2003,20 +2057,88 @@ class ConciseMemoryAgent:
         Returns:
             Dictionary with 'implemented' and 'unimplemented' formatted lists
         """
-        implemented_list = (
-            "\n".join([f"- {file}" for file in self.implemented_files])
-            if self.implemented_files
-            else "- None yet"
+        implemented_list = self._format_file_list_preview(
+            self.implemented_files, empty_text="- None yet"
         )
 
         unimplemented_files = self.get_unimplemented_files()
-        unimplemented_list = (
-            "\n".join([f"- {file}" for file in unimplemented_files])
-            if unimplemented_files
-            else "- All files implemented!"
+        unimplemented_list = self._format_file_list_preview(
+            unimplemented_files, empty_text="- All files implemented!"
         )
 
         return {"implemented": implemented_list, "unimplemented": unimplemented_list}
+
+    def _format_file_list_preview(
+        self,
+        files: List[str],
+        *,
+        max_items: int = 60,
+        empty_text: str,
+    ) -> str:
+        if not files:
+            return empty_text
+        preview = files[:max_items]
+        lines = [f"- {file_path}" for file_path in preview]
+        remaining = len(files) - len(preview)
+        if remaining > 0:
+            lines.append(f"- ... and {remaining} more")
+        return "\n".join(lines)
+
+    def _extract_openai_responses_text(self, response: Any) -> str:
+        """
+        Extract assistant text from a (possibly normalized) Responses API result.
+        """
+        if isinstance(response, dict):
+            output_text = response.get("output_text")
+            if isinstance(output_text, str) and output_text.strip():
+                return output_text
+            output = response.get("output")
+        else:
+            output_text = getattr(response, "output_text", None)
+            if isinstance(output_text, str) and output_text.strip():
+                return output_text
+            output = getattr(response, "output", None)
+
+        if not isinstance(output, list):
+            return ""
+
+        parts: list[str] = []
+        for item in output:
+            if isinstance(item, dict):
+                raw_item = item
+            else:
+                dump = getattr(item, "model_dump", None)
+                raw_item = dump() if callable(dump) else None
+
+            if not isinstance(raw_item, dict):
+                continue
+            if raw_item.get("type") != "message":
+                continue
+
+            content = raw_item.get("content")
+            if isinstance(content, str):
+                if content.strip():
+                    parts.append(content)
+                continue
+            if not isinstance(content, list):
+                continue
+
+            for part in content:
+                if isinstance(part, dict):
+                    raw_part = part
+                else:
+                    dump = getattr(part, "model_dump", None)
+                    raw_part = dump() if callable(dump) else None
+
+                if not isinstance(raw_part, dict):
+                    continue
+                if raw_part.get("type") != "output_text":
+                    continue
+                text = raw_part.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text)
+
+        return "\n".join(parts)
 
     def get_current_next_steps(self) -> str:
         """Get the current Next Steps information"""

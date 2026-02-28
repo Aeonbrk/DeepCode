@@ -34,6 +34,7 @@ from workflows.agents.memory_agent_concise import ConciseMemoryAgent
 from config.mcp_tool_definitions import get_mcp_tools
 from utils.llm_utils import get_preferred_llm_class, get_default_models, load_api_config
 from utils.openai_compat import get_openai_base_url_info, OpenAIEndpointHint
+from utils.mcp_agent_compat import _normalize_responses_result
 # DialogueLogger removed - no longer needed
 
 
@@ -62,6 +63,10 @@ class CodeImplementationWorkflow:
         self.enable_read_tools = (
             True  # Default value, will be overridden by run_workflow parameter
         )
+        self.openai_endpoint_hint = OpenAIEndpointHint.ROOT
+        # For OpenAI Responses API execution, prefer stateful continuation when the
+        # gateway supports it, otherwise fall back to stateless (no previous_response_id).
+        self.openai_responses_mode = "stateful"
 
     def _load_api_config(self) -> Dict[str, Any]:
         """Load API configuration with environment variable override."""
@@ -337,10 +342,33 @@ Requirements:
 
         # Connect code agent with memory agent for summary generation
         # Note: Concise memory agent doesn't need LLM client for summary generation
-        code_agent.set_memory_agent(memory_agent, client, client_type)
+        code_agent.set_memory_agent(
+            memory_agent,
+            client,
+            client_type,
+            openai_use_responses=(
+                client_type == "openai"
+                and self.openai_endpoint_hint == OpenAIEndpointHint.RESPONSES
+            ),
+        )
 
         # Initialize memory agent with iteration 0
         memory_agent.start_new_round(iteration=0)
+
+        if (
+            client_type == "openai"
+            and self.openai_endpoint_hint == OpenAIEndpointHint.RESPONSES
+        ):
+            return await self._pure_code_implementation_loop_openai_responses(
+                client=client,
+                code_agent=code_agent,
+                memory_agent=memory_agent,
+                tools=tools,
+                initial_messages=messages,
+                max_iterations=max_iterations,
+                start_time=start_time,
+                max_time=max_time,
+            )
 
         while iteration < max_iterations:
             iteration += 1
@@ -459,6 +487,674 @@ Requirements:
                 messages = memory_agent.apply_memory_optimization(
                     current_system_message, messages, files_implemented_count
                 )
+
+        return await self._generate_pure_code_final_report_with_concise_agents(
+            iteration, time.time() - start_time, code_agent, memory_agent
+        )
+
+    def _build_openai_responses_tools(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        response_tools: List[Dict[str, Any]] = []
+        for tool in tools:
+            response_tools.append(
+                {
+                    "type": "function",
+                    "name": tool["name"],
+                    "description": tool.get("description"),
+                    "parameters": tool.get("input_schema"),
+                    "strict": False,
+                }
+            )
+        return response_tools
+
+    async def _wait_for_openai_responses_completion(
+        self,
+        client: Any,
+        response: Any,
+        timeout_seconds: int = 30,
+        poll_interval_seconds: float = 1.0,
+    ) -> Any:
+        normalized = _normalize_responses_result(response)
+        if isinstance(normalized, dict):
+            response_id = normalized.get("id")
+            status = normalized.get("status")
+            output_text = normalized.get("output_text")
+            output_items = normalized.get("output")
+        else:
+            response_id = getattr(normalized, "id", None)
+            status = getattr(normalized, "status", None)
+            output_text = getattr(normalized, "output_text", None)
+            output_items = getattr(normalized, "output", None)
+
+        if not response_id:
+            return normalized
+        # Some gateways return usable output without ever supporting retrieve/polling.
+        if (isinstance(output_text, str) and output_text.strip()) or (
+            isinstance(output_items, list) and output_items
+        ):
+            return normalized
+        if status not in {"queued", "in_progress"}:
+            return normalized
+
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        latest = normalized
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(poll_interval_seconds)
+            try:
+                polled = await client.responses.retrieve(response_id)
+            except Exception as e:
+                self.logger.warning(
+                    f"Responses retrieve/polling unsupported or failed (id={response_id}): {e}"
+                )
+                return latest
+
+            latest = _normalize_responses_result(polled)
+            if isinstance(latest, dict):
+                status = latest.get("status")
+                output_text = latest.get("output_text")
+                output_items = latest.get("output")
+            else:
+                status = getattr(latest, "status", None)
+                output_text = getattr(latest, "output_text", None)
+                output_items = getattr(latest, "output", None)
+
+            if (isinstance(output_text, str) and output_text.strip()) or (
+                isinstance(output_items, list) and output_items
+            ):
+                return latest
+            if status in {"completed", "failed", "cancelled", "incomplete"}:
+                return latest
+
+        return latest
+
+    def _extract_openai_responses_tool_calls(self, response: Any) -> List[Dict[str, Any]]:
+        normalized = _normalize_responses_result(response)
+        output = normalized.get("output") if isinstance(normalized, dict) else getattr(normalized, "output", None)
+        if not isinstance(output, list):
+            return []
+
+        tool_calls: List[Dict[str, Any]] = []
+        for item in output:
+            if isinstance(item, dict):
+                data = item
+            else:
+                dump = getattr(item, "model_dump", None)
+                data = dump() if callable(dump) else None
+
+            if not isinstance(data, dict):
+                continue
+            if data.get("type") != "function_call":
+                continue
+
+            call_id = data.get("call_id") or data.get("id")
+            name = data.get("name")
+            arguments = data.get("arguments")
+
+            if not call_id or not name:
+                continue
+
+            parsed_input: Any = None
+            if isinstance(arguments, dict):
+                parsed_input = arguments
+            elif arguments is None:
+                parsed_input = None
+            elif isinstance(arguments, str):
+                try:
+                    parsed_input = json.loads(arguments)
+                except (json.JSONDecodeError, TypeError):
+                    parsed_input = self._repair_truncated_json(arguments, name)
+            else:
+                arguments_text = str(arguments)
+                try:
+                    parsed_input = json.loads(arguments_text)
+                except (json.JSONDecodeError, TypeError):
+                    parsed_input = self._repair_truncated_json(arguments_text, name)
+
+            if not isinstance(parsed_input, dict):
+                self.logger.warning(
+                    f"Skipping tool call with unparseable arguments: {name}"
+                )
+                tool_calls.append(
+                    {
+                        "id": call_id,
+                        "name": name,
+                        "input": {},
+                        "_unparseable_arguments": True,
+                    }
+                )
+                continue
+
+            tool_calls.append({"id": call_id, "name": name, "input": parsed_input})
+
+        return tool_calls
+
+    def _tool_result_to_text(self, result: Any, max_chars: int = 50_000) -> str:
+        if result is None:
+            return ""
+
+        if isinstance(result, str):
+            text = result
+        elif isinstance(result, (dict, list)):
+            text = json.dumps(result, ensure_ascii=False)
+        elif hasattr(result, "content"):
+            content = getattr(result, "content")
+            if isinstance(content, list) and content:
+                first = content[0]
+                text_part = getattr(first, "text", None)
+                text = text_part if isinstance(text_part, str) else str(first)
+            else:
+                text = str(content)
+        else:
+            text = str(result)
+
+        if max_chars and len(text) > max_chars:
+            return text[:max_chars] + "\n... (tool output truncated)"
+        return text
+
+    def _build_progress_update_message(
+        self,
+        memory_agent: ConciseMemoryAgent,
+        files_implemented: int,
+        has_error: bool,
+        no_progress_write_rounds: int = 0,
+    ) -> str:
+        unimplemented_files = memory_agent.get_unimplemented_files()
+        remaining_count = len(unimplemented_files)
+
+        preview_files = unimplemented_files[:3]
+        preview_text = (
+            "\n".join([f"- {file_path}" for file_path in preview_files])
+            if preview_files
+            else "- None"
+        )
+        more_text = (
+            f"\n- ... and {remaining_count - len(preview_files)} more"
+            if remaining_count > len(preview_files)
+            else ""
+        )
+        header = "❌ Tool error detected in the previous step.\n\n" if has_error else ""
+        no_progress_line = (
+            f"- Consecutive no-progress write rounds: {no_progress_write_rounds}\n"
+            if no_progress_write_rounds > 0
+            else ""
+        )
+
+        return (
+            header
+            + f"""✅ Progress Update (compact)
+
+- Files implemented: {files_implemented}
+- Files remaining: {remaining_count}
+{no_progress_line}Next files to implement (up to 3):
+{preview_text}{more_text}
+
+IMPORTANT:
+- Continue with the next unimplemented file.
+- Avoid rewriting files that were already implemented unless fixing an explicit error.
+- If all files are implemented, reply exactly: All files implemented
+"""
+        )
+
+    def _build_reset_bootstrap_message(
+        self,
+        memory_agent: ConciseMemoryAgent,
+        files_implemented: int,
+        reset_reason: str,
+        has_error: bool,
+        no_progress_write_rounds: int,
+        tool_calls: List[Dict[str, Any]],
+        tool_results: List[Dict[str, Any]],
+    ) -> str:
+        unimplemented_files = memory_agent.get_unimplemented_files()
+        remaining_count = len(unimplemented_files)
+        preview_files = unimplemented_files[:3]
+        preview_text = (
+            "\n".join([f"- {file_path}" for file_path in preview_files])
+            if preview_files
+            else "- None"
+        )
+        more_text = (
+            f"\n- ... and {remaining_count - len(preview_files)} more"
+            if remaining_count > len(preview_files)
+            else ""
+        )
+
+        tool_lines: List[str] = []
+        for tool_call, tool_result in zip(tool_calls[:5], tool_results[:5]):
+            tool_name = str(tool_call.get("name", "unknown"))
+            file_path = tool_call.get("input", {}).get("file_path")
+            file_suffix = f" ({file_path})" if file_path else ""
+            result_text = self._tool_result_to_text(tool_result.get("result"), max_chars=400)
+            status = "error" if "error" in result_text.lower() else "ok"
+            tool_lines.append(f"- {tool_name}{file_suffix}: {status}")
+        if len(tool_calls) > len(tool_lines):
+            tool_lines.append(f"- ... and {len(tool_calls) - len(tool_lines)} more")
+        tool_summary = "\n".join(tool_lines) if tool_lines else "- none"
+
+        if reset_reason == "no_progress_write_limit":
+            reason_text = "No-progress write safeguard triggered."
+        elif reset_reason == "periodic_write_limit":
+            reason_text = "Periodic context reset after write limit."
+        elif reset_reason == "write_file_boundary":
+            reason_text = "Write-file boundary context reset."
+        elif reset_reason == "large_tool_output":
+            reason_text = "Large tool output context reset."
+        elif reset_reason == "missing_response_id":
+            reason_text = "Missing response id; cannot safely continue chain."
+        else:
+            reason_text = "Context reset."
+
+        error_line = (
+            "Tool errors were detected in the previous step."
+            if has_error
+            else "No tool errors were detected in the previous step."
+        )
+        no_progress_line = (
+            f"No-progress write rounds: {no_progress_write_rounds}."
+            if no_progress_write_rounds > 0
+            else ""
+        )
+
+        return f"""🔄 Responses thread reset
+
+Reason: {reason_text}
+Previous step tool summary:
+{tool_summary}
+{error_line}
+{no_progress_line}
+
+Current status:
+- Files implemented: {files_implemented}
+- Files remaining: {remaining_count}
+
+Next files to implement (up to 3):
+{preview_text}{more_text}
+
+Continue from the current filesystem state. Implement the next unimplemented file and avoid rewriting already-implemented files unless fixing an explicit error.
+If all files are implemented, reply exactly: All files implemented
+"""
+
+    def _build_stateless_tool_followup_message(
+        self,
+        memory_agent: ConciseMemoryAgent,
+        files_implemented: int,
+        tool_calls: List[Dict[str, Any]],
+        tool_results: List[Dict[str, Any]],
+        has_error: bool,
+        no_progress_write_rounds: int,
+    ) -> str:
+        unimplemented_files = memory_agent.get_unimplemented_files()
+        remaining_count = len(unimplemented_files)
+        preview_files = unimplemented_files[:3]
+        preview_text = (
+            "\n".join([f"- {file_path}" for file_path in preview_files])
+            if preview_files
+            else "- None"
+        )
+        more_text = (
+            f"\n- ... and {remaining_count - len(preview_files)} more"
+            if remaining_count > len(preview_files)
+            else ""
+        )
+
+        header = "❌ Tool error detected in the previous step.\n\n" if has_error else ""
+        no_progress_line = (
+            f"- Consecutive no-progress write rounds: {no_progress_write_rounds}\n"
+            if no_progress_write_rounds > 0
+            else ""
+        )
+
+        tool_blocks: List[str] = []
+        for tool_call, tool_result in list(zip(tool_calls, tool_results))[:4]:
+            tool_name = str(tool_call.get("name", "unknown"))
+            tool_input = tool_call.get("input") if isinstance(tool_call, dict) else None
+            file_path = tool_input.get("file_path") if isinstance(tool_input, dict) else None
+            file_suffix = f" ({file_path})" if file_path else ""
+            output_text = self._tool_result_to_text(tool_result.get("result"), max_chars=2000)
+            tool_blocks.append(
+                f"- Tool: {tool_name}{file_suffix}\n```text\n{output_text}\n```"
+            )
+        if len(tool_calls) > len(tool_blocks):
+            tool_blocks.append(f"- ... and {len(tool_calls) - len(tool_blocks)} more tool calls")
+        tool_details = "\n".join(tool_blocks) if tool_blocks else "- none"
+
+        return (
+            header
+            + f"""✅ Progress Update (stateless)
+
+- Files implemented: {files_implemented}
+- Files remaining: {remaining_count}
+{no_progress_line}Last step tool outputs (truncated):
+{tool_details}
+
+Next files to implement (up to 3):
+{preview_text}{more_text}
+
+IMPORTANT:
+- Continue from the current filesystem state.
+- Implement the next unimplemented file.
+- Avoid rewriting already-implemented files unless fixing an explicit error.
+- If all files are implemented, reply exactly: All files implemented
+"""
+        )
+
+    async def _pure_code_implementation_loop_openai_responses(
+        self,
+        client: Any,
+        code_agent: CodeImplementationAgent,
+        memory_agent: ConciseMemoryAgent,
+        tools: List[Dict[str, Any]],
+        initial_messages: List[Dict[str, Any]],
+        max_iterations: int,
+        start_time: float,
+        max_time: float,
+    ) -> str:
+        impl_model = self.default_models.get(
+            "openai_implementation", self.default_models["openai"]
+        )
+        self.logger.info(f"🔧 Code generation using model: {impl_model} (Responses API)")
+
+        response_tools = self._build_openai_responses_tools(tools)
+
+        initial_user_content = ""
+        if initial_messages:
+            last = initial_messages[-1]
+            initial_user_content = last.get("content", "") if isinstance(last, dict) else ""
+        if not initial_user_content.strip():
+            initial_user_content = "Please continue implementing the codebase."
+
+        previous_response_id: Optional[str] = None
+        pending_input_items: List[Dict[str, Any]] = [
+            {"type": "message", "role": "user", "content": initial_user_content}
+        ]
+        no_progress_write_round_limit = 3
+        no_progress_write_rounds = 0
+        last_files_count = code_agent.get_files_implemented_count()
+
+        self.logger.info(f"Responses mode: {self.openai_responses_mode}")
+
+        iteration = 0
+        while iteration < max_iterations:
+            iteration += 1
+            elapsed_time = time.time() - start_time
+            if elapsed_time > max_time:
+                self.logger.warning(f"Time limit reached: {elapsed_time:.2f}s")
+                break
+
+            payload: Dict[str, Any] = {
+                "model": impl_model,
+                "input": pending_input_items,
+                "tools": response_tools,
+                "max_output_tokens": 8192,
+                "temperature": 0.2,
+            }
+            using_stateful_chain = (
+                self.openai_responses_mode == "stateful" and bool(previous_response_id)
+            )
+            if using_stateful_chain:
+                payload["previous_response_id"] = previous_response_id
+            else:
+                payload["instructions"] = code_agent.get_system_prompt()
+
+            try:
+                response = await client.responses.create(**payload)
+            except Exception as e:
+                err_text = str(e).lower()
+                if "temperature" in err_text and any(
+                    marker in err_text
+                    for marker in ("unsupported", "unexpected", "unknown", "unrecognized")
+                ):
+                    self.logger.warning(
+                        "Responses gateway rejected `temperature`; retrying without it."
+                    )
+                    payload.pop("temperature", None)
+                    response = await client.responses.create(**payload)
+                elif (
+                    using_stateful_chain
+                    and "unsupported parameter" in err_text
+                    and "previous_response_id" in err_text
+                ):
+                    self.logger.warning(
+                        "Responses continuation rejected by gateway; switching to stateless Responses mode."
+                    )
+                    self.openai_responses_mode = "stateless"
+                    previous_response_id = None
+                    payload.pop("previous_response_id", None)
+                    payload["instructions"] = code_agent.get_system_prompt()
+                    try:
+                        response = await client.responses.create(**payload)
+                    except Exception as e2:
+                        err_text2 = str(e2).lower()
+                        if "temperature" in err_text2 and any(
+                            marker in err_text2
+                            for marker in ("unsupported", "unexpected", "unknown", "unrecognized")
+                        ):
+                            self.logger.warning(
+                                "Responses gateway rejected `temperature`; retrying without it."
+                            )
+                            payload.pop("temperature", None)
+                            response = await client.responses.create(**payload)
+                        else:
+                            raise
+                else:
+                    raise RuntimeError(
+                        f"Responses API call failed while endpoint_hint={self.openai_endpoint_hint}."
+                    ) from e
+
+            response = await self._wait_for_openai_responses_completion(client, response)
+            response_id = (
+                response.get("id")
+                if isinstance(response, dict)
+                else getattr(response, "id", None)
+            )
+            response_status = (
+                response.get("status")
+                if isinstance(response, dict)
+                else getattr(response, "status", None)
+            )
+            response_output_text = (
+                response.get("output_text")
+                if isinstance(response, dict)
+                else getattr(response, "output_text", None)
+            )
+            if response_id:
+                previous_response_id = response_id
+            else:
+                self.logger.warning(
+                    "Responses result missing id; resetting continuation chain for safety."
+                )
+                previous_response_id = None
+            missing_response_id = not bool(response_id)
+
+            tool_calls = self._extract_openai_responses_tool_calls(response)
+            has_any_output = bool((response_output_text or "").strip()) or bool(tool_calls)
+
+            if response_status in {"failed", "cancelled", "incomplete"}:
+                raise RuntimeError(
+                    "Responses API returned terminal failure status "
+                    f"'{response_status}' with output: {response_output_text}"
+                )
+            if response_status in {"queued", "in_progress"} and not has_any_output:
+                raise RuntimeError(
+                    "Responses API did not reach terminal/completed status "
+                    "within wait timeout."
+                )
+            if response_status in {"queued", "in_progress"} and has_any_output:
+                self.logger.warning(
+                    "Responses returned status "
+                    f"'{response_status}' but included output; proceeding."
+                )
+
+            if tool_calls:
+                executable_tool_calls = [
+                    tc for tc in tool_calls if not tc.get("_unparseable_arguments")
+                ]
+                executed_tool_results = (
+                    await code_agent.execute_tool_calls(executable_tool_calls)
+                    if executable_tool_calls
+                    else []
+                )
+                executed_results_iter = iter(executed_tool_results)
+                tool_results: List[Dict[str, Any]] = []
+                for tool_call in tool_calls:
+                    if tool_call.get("_unparseable_arguments"):
+                        tool_results.append(
+                            {
+                                "tool_name": tool_call["name"],
+                                "result": json.dumps(
+                                    {
+                                        "status": "error",
+                                        "message": "Skipped execution due to unparseable arguments.",
+                                    }
+                                ),
+                            }
+                        )
+                    else:
+                        tool_results.append(
+                            next(
+                                executed_results_iter,
+                                {
+                                    "tool_name": tool_call["name"],
+                                    "result": json.dumps(
+                                        {
+                                            "status": "error",
+                                            "message": "Missing tool execution result.",
+                                        }
+                                    ),
+                                },
+                            )
+                        )
+
+                for tool_call, tool_result in zip(tool_calls, tool_results):
+                    memory_agent.record_tool_result(
+                        tool_name=tool_call["name"],
+                        tool_input=tool_call["input"],
+                        tool_result=tool_result.get("result"),
+                    )
+
+                implementation_summary = code_agent.get_implementation_summary()
+                for file_info in implementation_summary.get("completed_files", []):
+                    file_path = file_info.get("file")
+                    if file_path:
+                        memory_agent.record_file_implementation(file_path)
+
+                has_error = self._check_tool_results_for_errors(tool_results)
+                files_count = code_agent.get_files_implemented_count()
+
+                wrote_file = any(
+                    tc.get("name") == "write_file"
+                    and not tc.get("_unparseable_arguments")
+                    for tc in tool_calls
+                )
+
+                if wrote_file:
+                    if files_count <= last_files_count:
+                        no_progress_write_rounds += 1
+                    else:
+                        no_progress_write_rounds = 0
+                    last_files_count = files_count
+                else:
+                    last_files_count = files_count
+                    no_progress_write_rounds = 0
+
+                reset_reason: Optional[str] = None
+                if missing_response_id:
+                    reset_reason = "missing_response_id"
+                elif wrote_file and no_progress_write_rounds >= no_progress_write_round_limit:
+                    reset_reason = "no_progress_write_limit"
+                elif wrote_file:
+                    reset_reason = "write_file_boundary"
+                elif self.openai_responses_mode == "stateful":
+                    # When using stateful continuation, large tool outputs (e.g. full file reads)
+                    # can accumulate server-side and exhaust context. Force a reset and continue
+                    # from a compact bootstrap message.
+                    max_single_chars = 15_000
+                    max_total_chars = 30_000
+                    total_chars = 0
+                    for tool_result in tool_results[:8]:
+                        raw = tool_result.get("result")
+                        size = len(raw) if isinstance(raw, str) else len(str(raw or ""))
+                        total_chars += size
+                        if size >= max_single_chars or total_chars >= max_total_chars:
+                            reset_reason = "large_tool_output"
+                            break
+
+                if reset_reason:
+                    no_progress_snapshot = no_progress_write_rounds
+                    self.logger.warning(
+                        "Resetting Responses thread "
+                        f"(reason={reset_reason}, no_progress_write_rounds={no_progress_snapshot}, "
+                        f"iteration={iteration})"
+                    )
+                    previous_response_id = None
+                    no_progress_write_rounds = 0
+                    pending_input_items = [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": self._build_reset_bootstrap_message(
+                                memory_agent=memory_agent,
+                                files_implemented=files_count,
+                                reset_reason=reset_reason,
+                                has_error=has_error,
+                                no_progress_write_rounds=no_progress_snapshot,
+                                tool_calls=tool_calls,
+                                tool_results=tool_results,
+                            ),
+                        }
+                    ]
+                else:
+                    if self.openai_responses_mode == "stateful":
+                        pending_input_items = []
+                        for tool_call, tool_result in zip(tool_calls, tool_results):
+                            pending_input_items.append(
+                                {
+                                    "type": "function_call_output",
+                                    "call_id": tool_call["id"],
+                                    "output": self._tool_result_to_text(
+                                        tool_result.get("result")
+                                    ),
+                                }
+                            )
+                    else:
+                        pending_input_items = [
+                            {
+                                "type": "message",
+                                "role": "user",
+                                "content": self._build_stateless_tool_followup_message(
+                                    memory_agent=memory_agent,
+                                    files_implemented=files_count,
+                                    tool_calls=tool_calls,
+                                    tool_results=tool_results,
+                                    has_error=has_error,
+                                    no_progress_write_rounds=no_progress_write_rounds,
+                                ),
+                            }
+                        ]
+            else:
+                unimplemented_files = memory_agent.get_unimplemented_files()
+                if not unimplemented_files:
+                    self.logger.info(
+                        "✅ Code implementation complete - All files implemented"
+                    )
+                    break
+
+                files_count = code_agent.get_files_implemented_count()
+                pending_input_items = [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": self._generate_no_tools_guidance(files_count),
+                    }
+                ]
+
+            memory_agent.start_new_round(iteration=iteration)
+
+            unimplemented_files = memory_agent.get_unimplemented_files()
+            if not unimplemented_files:
+                self.logger.info(
+                    "✅ Code implementation complete - All files implemented"
+                )
+                break
 
         return await self._generate_pure_code_final_report_with_concise_agents(
             iteration, time.time() - start_time, code_agent, memory_agent
@@ -588,13 +1284,16 @@ Requirements:
 
                 openai_config = self.api_config.get("openai", {})
                 base_url = openai_config.get("base_url")
+                base_url_raw = openai_config.get("base_url_raw") or base_url
                 default_query = openai_config.get("default_query")
-                endpoint_hint = None
+                endpoint_hint = OpenAIEndpointHint.ROOT
 
-                if base_url:
-                    info = get_openai_base_url_info(base_url)
-                    base_url = info.sdk_base_url
+                if base_url_raw:
+                    info = get_openai_base_url_info(base_url_raw)
+                    if not base_url:
+                        base_url = info.sdk_base_url
                     endpoint_hint = info.endpoint_hint
+                    self.openai_endpoint_hint = endpoint_hint
                     if info.default_query:
                         merged_query = {}
                         if isinstance(default_query, dict):
@@ -615,17 +1314,54 @@ Requirements:
 
                 try:
                     if endpoint_hint == OpenAIEndpointHint.RESPONSES:
-                        await client.responses.create(
+                        self.openai_responses_mode = "stateful"
+                        resp = await client.responses.create(
                             model=model_name,
-                            input=[
-                                {
-                                    "type": "message",
-                                    "role": "user",
-                                    "content": [{"type": "input_text", "text": "test"}],
-                                }
-                            ],
+                            input=[{"type": "message", "role": "user", "content": "test"}],
                             max_output_tokens=20,
                         )
+                        normalized = _normalize_responses_result(resp)
+                        response_id = (
+                            normalized.get("id")
+                            if isinstance(normalized, dict)
+                            else getattr(normalized, "id", None)
+                        )
+                        if not response_id:
+                            raise ValueError(
+                                f"Responses API test call returned no id (type={type(resp).__name__})"
+                            )
+                        try:
+                            resp2 = await client.responses.create(
+                                model=model_name,
+                                previous_response_id=response_id,
+                                input=[
+                                    {"type": "message", "role": "user", "content": "test2"}
+                                ],
+                                max_output_tokens=20,
+                            )
+                            normalized2 = _normalize_responses_result(resp2)
+                            response_id2 = (
+                                normalized2.get("id")
+                                if isinstance(normalized2, dict)
+                                else getattr(normalized2, "id", None)
+                            )
+                            if not response_id2:
+                                raise ValueError(
+                                    f"Responses continuation returned no id (type={type(resp2).__name__})"
+                                )
+                        except Exception as cont_exc:
+                            cont_err = str(cont_exc).lower()
+                            if (
+                                "unsupported parameter" in cont_err
+                                and "previous_response_id" in cont_err
+                            ):
+                                self.openai_responses_mode = "stateless"
+                                self.logger.warning(
+                                    "Responses continuation is unsupported by this gateway "
+                                    "(previous_response_id rejected). Switching to stateless Responses mode."
+                                )
+                            else:
+                                raise
                     else:
                         await client.chat.completions.create(
                             model=model_name,
@@ -653,6 +1389,13 @@ Requirements:
                     self.logger.info(f"Using custom base URL: {base_url}")
                 return client, "openai"
             except Exception as e:
+                if endpoint_hint == OpenAIEndpointHint.RESPONSES:
+                    raise RuntimeError(
+                        "OpenAI is configured for the Responses API but the gateway preflight failed. "
+                        "Fix the gateway compatibility (Responses API + tools) or point `openai.base_url` "
+                        "to a working OpenAI-compatible endpoint."
+                    ) from e
+
                 self.logger.warning(f"OpenAI API unavailable: {e}")
                 return None
 
@@ -1342,11 +2085,12 @@ Requirements:
                 history_result = await self.mcp_agent.call_tool(
                     "get_operation_history", {"last_n": 30}
                 )
-                history_data = (
-                    json.loads(history_result)
-                    if isinstance(history_result, str)
-                    else history_result
-                )
+                history_text = self._tool_result_to_text(history_result, max_chars=0)
+                try:
+                    parsed = json.loads(history_text) if history_text else {}
+                    history_data = parsed if isinstance(parsed, dict) else {}
+                except json.JSONDecodeError:
+                    history_data = {}
             else:
                 history_data = {"total_operations": 0, "history": []}
 
