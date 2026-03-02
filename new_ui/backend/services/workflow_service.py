@@ -267,6 +267,33 @@ class WorkflowService:
         await self._broadcast(task_id, cancelled_message)
         return {"status": "cancelled", "reason": reason}
 
+    async def _finalize_unstarted_dispatch(
+        self, task_id: str, task: Optional[WorkflowTask], reason: str
+    ) -> None:
+        """Ensure dispatch failures cannot leave a task stuck in pending."""
+        if not task or task.status != "pending":
+            return
+
+        if self._is_cancelled(task):
+            await self._finalize_cancelled(task_id, task, task.message or reason)
+            return
+
+        safe_reason = redact_text(reason)
+        task.status = "error"
+        task.message = safe_reason
+        task.error = safe_reason
+        task.completed_at = datetime.utcnow()
+
+        await self._broadcast(
+            task_id,
+            {
+                "type": "error",
+                "task_id": task_id,
+                "error": safe_reason,
+            },
+        )
+        self._prune_tasks()
+
     async def execute_paper_to_code(
         self,
         task_id: str,
@@ -275,73 +302,243 @@ class WorkflowService:
         enable_indexing: bool = False,
     ) -> Dict[str, Any]:
         """Execute paper-to-code workflow"""
-        # Lazy imports - DeepCode modules found via sys.path set in main.py
-        from mcp_agent.app import MCPApp
-        from workflows.agent_orchestration_engine import (
-            execute_multi_agent_research_pipeline,
-        )
-
         task = self._tasks.get(task_id)
         if not task:
             return {"status": "error", "error": "Task not found"}
 
-        async with self._execution_lock:
-            self._cancellation_checkpoint(task)
-            task.status = "running"
-            task.started_at = datetime.utcnow()
+        try:
+            async with self._execution_lock:
+                self._cancellation_checkpoint(task)
+                task.status = "running"
+                task.started_at = datetime.utcnow()
 
-            try:
-                progress_callback = await self._create_progress_callback(task_id)
-
-                with self._project_root_cwd():
-                    # Create MCP app context with explicit config path
-                    # Compat: allow OpenAI reasoning_effort values (e.g. xhigh) used by
-                    # some OpenAI-compatible gateways.
-                    from utils.mcp_agent_compat import (
-                        ensure_current_python_on_path,
-                        patch_mcp_agent_openai_reasoning_effort,
-                        patch_mcp_agent_openai_base_url_routing,
-                        patch_mcp_agent_openai_executor_raise_on_error,
+                try:
+                    # Lazy imports - DeepCode modules found via sys.path set in main.py
+                    from mcp_agent.app import MCPApp
+                    from workflows.agent_orchestration_engine import (
+                        execute_multi_agent_research_pipeline,
                     )
 
-                    ensure_current_python_on_path()
-                    patch_mcp_agent_openai_reasoning_effort()
-                    patch_mcp_agent_openai_base_url_routing()
-                    patch_mcp_agent_openai_executor_raise_on_error()
-                    self._cancellation_checkpoint(task)
-                    app = MCPApp(name="paper_to_code", settings=str(CONFIG_PATH))
+                    progress_callback = await self._create_progress_callback(task_id)
 
-                    async with app.run() as agent_app:
-                        logger = agent_app.logger
-                        context = agent_app.context
-
-                        # Add current working directory to filesystem server args
-                        context.config.mcp.servers["filesystem"].args.extend(
-                            [os.getcwd()]
+                    with self._project_root_cwd():
+                        # Create MCP app context with explicit config path
+                        # Compat: allow OpenAI reasoning_effort values (e.g. xhigh) used by
+                        # some OpenAI-compatible gateways.
+                        from utils.mcp_agent_compat import (
+                            ensure_current_python_on_path,
+                            patch_mcp_agent_openai_reasoning_effort,
+                            patch_mcp_agent_openai_base_url_routing,
+                            patch_mcp_agent_openai_executor_raise_on_error,
                         )
 
-                        # Execute the pipeline
-                        result = await execute_multi_agent_research_pipeline(
-                            input_source,
-                            logger,
-                            progress_callback,
-                            enable_indexing=enable_indexing,
-                        )
+                        ensure_current_python_on_path()
+                        patch_mcp_agent_openai_reasoning_effort()
+                        patch_mcp_agent_openai_base_url_routing()
+                        patch_mcp_agent_openai_executor_raise_on_error()
                         self._cancellation_checkpoint(task)
-                        if self._is_cancelled(task):
-                            return await self._finalize_cancelled(
-                                task_id, task, task.message or "Cancelled by user"
+                        app = MCPApp(name="paper_to_code", settings=str(CONFIG_PATH))
+
+                        async with app.run() as agent_app:
+                            logger = agent_app.logger
+                            context = agent_app.context
+
+                            # Add current working directory to filesystem server args
+                            context.config.mcp.servers["filesystem"].args.extend(
+                                [os.getcwd()]
                             )
 
-                        task.status = "completed"
-                        task.progress = 100
-                        task.result = redact_payload(
-                            {
-                                "status": "success",
-                                "repo_result": result,
-                            }
+                            # Execute the pipeline
+                            result = await execute_multi_agent_research_pipeline(
+                                input_source,
+                                logger,
+                                progress_callback,
+                                enable_indexing=enable_indexing,
+                            )
+                            self._cancellation_checkpoint(task)
+                            if self._is_cancelled(task):
+                                return await self._finalize_cancelled(
+                                    task_id, task, task.message or "Cancelled by user"
+                                )
+
+                            task.status = "completed"
+                            task.progress = 100
+                            task.result = redact_payload(
+                                {
+                                    "status": "success",
+                                    "repo_result": result,
+                                }
+                            )
+                            task.completed_at = datetime.utcnow()
+
+                            # Broadcast completion signal to all subscribers
+                            await self._broadcast(
+                                task_id,
+                                {
+                                    "type": "complete",
+                                    "task_id": task_id,
+                                    "status": "success",
+                                    "result": redact_payload(task.result),
+                                },
+                            )
+                            # Give WebSocket handlers time to receive the completion message
+                            await asyncio.sleep(0.5)
+                            self._prune_tasks()
+
+                            return task.result
+
+                except asyncio.CancelledError as e:
+                    return await self._finalize_cancelled(task_id, task, str(e))
+                except Exception as e:
+                    if self._is_cancelled(task):
+                        return await self._finalize_cancelled(
+                            task_id, task, "Cancelled by user"
                         )
-                        task.completed_at = datetime.utcnow()
+                    task.status = "error"
+                    task.error = redact_text(str(e))
+                    task.completed_at = datetime.utcnow()
+
+                    # Broadcast error signal to all subscribers
+                    await self._broadcast(
+                        task_id,
+                        {
+                            "type": "error",
+                            "task_id": task_id,
+                            "error": redact_text(str(e)),
+                        },
+                    )
+                    self._prune_tasks()
+
+                    return {"status": "error", "error": redact_text(str(e))}
+        finally:
+            await self._finalize_unstarted_dispatch(
+                task_id,
+                task,
+                "Workflow dispatch failed before execution started",
+            )
+
+    async def execute_chat_planning(
+        self,
+        task_id: str,
+        requirements: str,
+        enable_indexing: bool = False,
+        enable_user_interaction: bool = True,  # Enable User-in-Loop by default
+    ) -> Dict[str, Any]:
+        """Execute chat-based planning workflow"""
+        task = self._tasks.get(task_id)
+        if not task:
+            return {"status": "error", "error": "Task not found"}
+
+        try:
+            async with self._execution_lock:
+                self._cancellation_checkpoint(task)
+                task.status = "running"
+                task.started_at = datetime.utcnow()
+
+                try:
+                    # Lazy imports - DeepCode modules found via sys.path set in main.py
+                    from mcp_agent.app import MCPApp
+                    from workflows.agent_orchestration_engine import (
+                        execute_chat_based_planning_pipeline,
+                    )
+
+                    progress_callback = await self._create_progress_callback(task_id)
+
+                    with self._project_root_cwd():
+                        # Create MCP app context with explicit config path
+                        # Compat: allow OpenAI reasoning_effort values (e.g. xhigh) used by
+                        # some OpenAI-compatible gateways.
+                        from utils.mcp_agent_compat import (
+                            ensure_current_python_on_path,
+                            patch_mcp_agent_openai_reasoning_effort,
+                            patch_mcp_agent_openai_base_url_routing,
+                            patch_mcp_agent_openai_executor_raise_on_error,
+                        )
+
+                        ensure_current_python_on_path()
+                        patch_mcp_agent_openai_reasoning_effort()
+                        patch_mcp_agent_openai_base_url_routing()
+                        patch_mcp_agent_openai_executor_raise_on_error()
+                        self._cancellation_checkpoint(task)
+                        app = MCPApp(name="chat_planning", settings=str(CONFIG_PATH))
+
+                        async with app.run() as agent_app:
+                            logger = agent_app.logger
+                            context = agent_app.context
+
+                            # Add current working directory to filesystem server args
+                            context.config.mcp.servers["filesystem"].args.extend(
+                                [os.getcwd()]
+                            )
+
+                            # --- User-in-Loop: Before Planning Hook ---
+                            final_requirements = requirements
+                            plugin_integration = self._get_plugin_integration()
+
+                            if enable_user_interaction and plugin_integration:
+                                try:
+                                    from workflows.plugins import InteractionPoint
+
+                                    # Create plugin context
+                                    plugin_context = plugin_integration.create_context(
+                                        task_id=task_id,
+                                        user_input=requirements,
+                                        requirements=requirements,
+                                        enable_indexing=enable_indexing,
+                                    )
+
+                                    # Run BEFORE_PLANNING plugins (requirement analysis)
+                                    plugin_context = await plugin_integration.run_hook(
+                                        InteractionPoint.BEFORE_PLANNING,
+                                        plugin_context,
+                                    )
+                                    self._cancellation_checkpoint(task)
+
+                                    # Check if workflow was cancelled by user
+                                    if plugin_context.get("workflow_cancelled"):
+                                        reason = plugin_context.get(
+                                            "cancel_reason", "Cancelled by user"
+                                        )
+                                        return await self._finalize_cancelled(
+                                            task_id, task, reason
+                                        )
+
+                                    # Use potentially enhanced requirements
+                                    final_requirements = plugin_context.get(
+                                        "requirements", requirements
+                                    )
+                                    print(
+                                        f"[WorkflowService] Requirements after plugin: {len(final_requirements)} chars"
+                                    )
+
+                                except Exception as plugin_error:
+                                    print(
+                                        f"[WorkflowService] Plugin error (continuing without): {plugin_error}"
+                                    )
+                                    # Continue without plugin enhancement
+
+                            # Execute the pipeline with (possibly enhanced) requirements
+                            result = await execute_chat_based_planning_pipeline(
+                                final_requirements,
+                                logger,
+                                progress_callback,
+                                enable_indexing=enable_indexing,
+                            )
+                            self._cancellation_checkpoint(task)
+                            if self._is_cancelled(task):
+                                return await self._finalize_cancelled(
+                                    task_id, task, task.message or "Cancelled by user"
+                                )
+
+                            task.status = "completed"
+                            task.progress = 100
+                            task.result = redact_payload(
+                                {
+                                    "status": "success",
+                                    "repo_result": result,
+                                }
+                            )
+                            task.completed_at = datetime.utcnow()
 
                         # Broadcast completion signal to all subscribers
                         await self._broadcast(
@@ -359,190 +556,35 @@ class WorkflowService:
 
                         return task.result
 
-            except asyncio.CancelledError as e:
-                return await self._finalize_cancelled(task_id, task, str(e))
-            except Exception as e:
-                if self._is_cancelled(task):
-                    return await self._finalize_cancelled(
-                        task_id, task, "Cancelled by user"
-                    )
-                task.status = "error"
-                task.error = redact_text(str(e))
-                task.completed_at = datetime.utcnow()
-
-                # Broadcast error signal to all subscribers
-                await self._broadcast(
-                    task_id,
-                    {
-                        "type": "error",
-                        "task_id": task_id,
-                        "error": redact_text(str(e)),
-                    },
-                )
-                self._prune_tasks()
-
-                return {"status": "error", "error": redact_text(str(e))}
-
-    async def execute_chat_planning(
-        self,
-        task_id: str,
-        requirements: str,
-        enable_indexing: bool = False,
-        enable_user_interaction: bool = True,  # Enable User-in-Loop by default
-    ) -> Dict[str, Any]:
-        """Execute chat-based planning workflow"""
-        # Lazy imports - DeepCode modules found via sys.path set in main.py
-        from mcp_agent.app import MCPApp
-        from workflows.agent_orchestration_engine import (
-            execute_chat_based_planning_pipeline,
-        )
-
-        task = self._tasks.get(task_id)
-        if not task:
-            return {"status": "error", "error": "Task not found"}
-
-        async with self._execution_lock:
-            self._cancellation_checkpoint(task)
-            task.status = "running"
-            task.started_at = datetime.utcnow()
-
-            try:
-                progress_callback = await self._create_progress_callback(task_id)
-
-                with self._project_root_cwd():
-                    # Create MCP app context with explicit config path
-                    # Compat: allow OpenAI reasoning_effort values (e.g. xhigh) used by
-                    # some OpenAI-compatible gateways.
-                    from utils.mcp_agent_compat import (
-                        ensure_current_python_on_path,
-                        patch_mcp_agent_openai_reasoning_effort,
-                        patch_mcp_agent_openai_base_url_routing,
-                        patch_mcp_agent_openai_executor_raise_on_error,
-                    )
-
-                    ensure_current_python_on_path()
-                    patch_mcp_agent_openai_reasoning_effort()
-                    patch_mcp_agent_openai_base_url_routing()
-                    patch_mcp_agent_openai_executor_raise_on_error()
-                    self._cancellation_checkpoint(task)
-                    app = MCPApp(name="chat_planning", settings=str(CONFIG_PATH))
-
-                    async with app.run() as agent_app:
-                        logger = agent_app.logger
-                        context = agent_app.context
-
-                        # Add current working directory to filesystem server args
-                        context.config.mcp.servers["filesystem"].args.extend(
-                            [os.getcwd()]
+                except asyncio.CancelledError as e:
+                    return await self._finalize_cancelled(task_id, task, str(e))
+                except Exception as e:
+                    if self._is_cancelled(task):
+                        return await self._finalize_cancelled(
+                            task_id, task, "Cancelled by user"
                         )
+                    task.status = "error"
+                    task.error = redact_text(str(e))
+                    task.completed_at = datetime.utcnow()
 
-                        # --- User-in-Loop: Before Planning Hook ---
-                        final_requirements = requirements
-                        plugin_integration = self._get_plugin_integration()
-
-                        if enable_user_interaction and plugin_integration:
-                            try:
-                                from workflows.plugins import InteractionPoint
-
-                                # Create plugin context
-                                plugin_context = plugin_integration.create_context(
-                                    task_id=task_id,
-                                    user_input=requirements,
-                                    requirements=requirements,
-                                    enable_indexing=enable_indexing,
-                                )
-
-                                # Run BEFORE_PLANNING plugins (requirement analysis)
-                                plugin_context = await plugin_integration.run_hook(
-                                    InteractionPoint.BEFORE_PLANNING, plugin_context
-                                )
-                                self._cancellation_checkpoint(task)
-
-                                # Check if workflow was cancelled by user
-                                if plugin_context.get("workflow_cancelled"):
-                                    reason = plugin_context.get(
-                                        "cancel_reason", "Cancelled by user"
-                                    )
-                                    return await self._finalize_cancelled(
-                                        task_id, task, reason
-                                    )
-
-                                # Use potentially enhanced requirements
-                                final_requirements = plugin_context.get(
-                                    "requirements", requirements
-                                )
-                                print(
-                                    f"[WorkflowService] Requirements after plugin: {len(final_requirements)} chars"
-                                )
-
-                            except Exception as plugin_error:
-                                print(
-                                    f"[WorkflowService] Plugin error (continuing without): {plugin_error}"
-                                )
-                                # Continue without plugin enhancement
-
-                        # Execute the pipeline with (possibly enhanced) requirements
-                        result = await execute_chat_based_planning_pipeline(
-                            final_requirements,
-                            logger,
-                            progress_callback,
-                            enable_indexing=enable_indexing,
-                        )
-                        self._cancellation_checkpoint(task)
-                        if self._is_cancelled(task):
-                            return await self._finalize_cancelled(
-                                task_id, task, task.message or "Cancelled by user"
-                            )
-
-                        task.status = "completed"
-                        task.progress = 100
-                        task.result = redact_payload(
-                            {
-                                "status": "success",
-                                "repo_result": result,
-                            }
-                        )
-                        task.completed_at = datetime.utcnow()
-
-                    # Broadcast completion signal to all subscribers
+                    # Broadcast error signal to all subscribers
                     await self._broadcast(
                         task_id,
                         {
-                            "type": "complete",
+                            "type": "error",
                             "task_id": task_id,
-                            "status": "success",
-                            "result": redact_payload(task.result),
+                            "error": redact_text(str(e)),
                         },
                     )
-                    # Give WebSocket handlers time to receive the completion message
-                    await asyncio.sleep(0.5)
                     self._prune_tasks()
 
-                    return task.result
-
-            except asyncio.CancelledError as e:
-                return await self._finalize_cancelled(task_id, task, str(e))
-            except Exception as e:
-                if self._is_cancelled(task):
-                    return await self._finalize_cancelled(
-                        task_id, task, "Cancelled by user"
-                    )
-                task.status = "error"
-                task.error = redact_text(str(e))
-                task.completed_at = datetime.utcnow()
-
-                # Broadcast error signal to all subscribers
-                await self._broadcast(
-                    task_id,
-                    {
-                        "type": "error",
-                        "task_id": task_id,
-                        "error": redact_text(str(e)),
-                    },
-                )
-                self._prune_tasks()
-
-                return {"status": "error", "error": redact_text(str(e))}
+                    return {"status": "error", "error": redact_text(str(e))}
+        finally:
+            await self._finalize_unstarted_dispatch(
+                task_id,
+                task,
+                "Workflow dispatch failed before execution started",
+            )
 
     def cancel_task(self, task_id: str, reason: str = "Cancelled by user") -> bool:
         """Cancel a running task"""

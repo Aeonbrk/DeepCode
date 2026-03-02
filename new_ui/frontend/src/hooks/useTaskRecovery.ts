@@ -12,6 +12,7 @@
  */
 
 import { useEffect, useCallback, useState } from 'react';
+import axios from 'axios';
 import { useWorkflowStore } from '../stores/workflowStore';
 import { workflowsApi } from '../services/api';
 import { PAPER_TO_CODE_STEPS, CHAT_PLANNING_STEPS } from '../types/workflow';
@@ -23,6 +24,29 @@ interface RecoveryState {
   error: string | null;
 }
 
+function isTaskNotFoundError(error: unknown): boolean {
+  if (!axios.isAxiosError(error)) {
+    return false;
+  }
+
+  if (error.response?.status === 404) {
+    return true;
+  }
+
+  const responseData = error.response?.data as Record<string, unknown> | undefined;
+  const code = responseData?.code;
+  if (typeof code === 'string' && code.toUpperCase() === 'TASK_NOT_FOUND') {
+    return true;
+  }
+
+  const detail = responseData?.detail;
+  if (typeof detail === 'string' && detail.toLowerCase().includes('task not found')) {
+    return true;
+  }
+
+  return error.message.toLowerCase().includes('task not found');
+}
+
 export function useTaskRecovery() {
   const isDev = import.meta.env.DEV;
 
@@ -30,7 +54,6 @@ export function useTaskRecovery() {
     activeTaskId,
     workflowType,
     status,
-    setActiveTask,
     setStatus,
     setSteps,
     updateProgress,
@@ -43,7 +66,6 @@ export function useTaskRecovery() {
       activeTaskId: s.activeTaskId,
       workflowType: s.workflowType,
       status: s.status,
-      setActiveTask: s.setActiveTask,
       setStatus: s.setStatus,
       setSteps: s.setSteps,
       updateProgress: s.updateProgress,
@@ -75,22 +97,28 @@ export function useTaskRecovery() {
     try {
       // Query backend for task status
       const taskStatus = await workflowsApi.getStatus(activeTaskId);
+      const backendStatus = taskStatus.status;
+
+      const restoreWorkflowSteps = () => {
+        if (workflowType === 'paper-to-code') {
+          setSteps(PAPER_TO_CODE_STEPS);
+        } else if (workflowType === 'chat-planning') {
+          setSteps(CHAT_PLANNING_STEPS);
+        }
+      };
+
       if (isDev) {
         console.log('[TaskRecovery] Task status from backend:', taskStatus);
       }
 
-      if (taskStatus.status === 'running') {
+      if (backendStatus === 'running') {
         // Task is still running - restore steps and let WebSocket reconnect
         if (isDev) {
           console.log('[TaskRecovery] Task still running, reconnecting...');
         }
 
         // Restore steps based on workflow type
-        if (workflowType === 'paper-to-code') {
-          setSteps(PAPER_TO_CODE_STEPS);
-        } else if (workflowType === 'chat-planning') {
-          setSteps(CHAT_PLANNING_STEPS);
-        }
+        restoreWorkflowSteps();
 
         // Update progress from backend
         updateProgress(taskStatus.progress, taskStatus.message);
@@ -103,17 +131,53 @@ export function useTaskRecovery() {
           error: null,
         });
 
-      } else if (taskStatus.status === 'completed') {
+      } else if (backendStatus === 'pending') {
+        // Task is queued/initializing - keep current workflow state and continue listening
+        if (isDev) {
+          console.log('[TaskRecovery] Task pending, preserving recovery state...');
+        }
+
+        // Restore steps based on workflow type
+        restoreWorkflowSteps();
+
+        updateProgress(taskStatus.progress, taskStatus.message || 'Task is pending');
+        // Keep frontend in a recoverable active state while backend transitions to running
+        setStatus('running');
+        setNeedsRecovery(false);
+
+        setRecoveryState({
+          isRecovering: false,
+          recoveredTaskId: activeTaskId,
+          error: null,
+        });
+
+      } else if (backendStatus === 'waiting_for_input') {
+        // Task is paused for user input - keep active state and wait for interaction payload via WebSocket
+        if (isDev) {
+          console.log('[TaskRecovery] Task waiting for input, preserving active state...');
+        }
+
+        restoreWorkflowSteps();
+        updateProgress(
+          taskStatus.progress,
+          taskStatus.message || 'Task is waiting for your input'
+        );
+        setStatus('running');
+        setNeedsRecovery(false);
+
+        setRecoveryState({
+          isRecovering: false,
+          recoveredTaskId: activeTaskId,
+          error: null,
+        });
+
+      } else if (backendStatus === 'completed') {
         // Task completed while we were away
         if (isDev) {
           console.log('[TaskRecovery] Task completed, syncing final state...');
         }
 
-        if (workflowType === 'paper-to-code') {
-          setSteps(PAPER_TO_CODE_STEPS);
-        } else if (workflowType === 'chat-planning') {
-          setSteps(CHAT_PLANNING_STEPS);
-        }
+        restoreWorkflowSteps();
 
         updateProgress(100, 'Completed');
         setStatus('completed');
@@ -126,7 +190,7 @@ export function useTaskRecovery() {
           error: null,
         });
 
-      } else if (taskStatus.status === 'error') {
+      } else if (backendStatus === 'error') {
         // Task errored while we were away
         if (isDev) {
           console.log('[TaskRecovery] Task errored, syncing error state...');
@@ -142,10 +206,9 @@ export function useTaskRecovery() {
           error: taskStatus.error || null,
         });
 
-      } else {
-        // Unknown status, reset
+      } else if (backendStatus === 'cancelled') {
         if (isDev) {
-          console.log('[TaskRecovery] Unknown task status, resetting...');
+          console.log('[TaskRecovery] Task cancelled, clearing persisted state...');
         }
         reset();
         setRecoveryState({
@@ -153,23 +216,45 @@ export function useTaskRecovery() {
           recoveredTaskId: null,
           error: null,
         });
+
+      } else {
+        // Unknown status - keep state to avoid destructive resets on transient backend changes
+        if (isDev) {
+          console.warn('[TaskRecovery] Unknown task status, keeping current state:', backendStatus);
+        }
+        setNeedsRecovery(true);
+        setRecoveryState({
+          isRecovering: false,
+          recoveredTaskId: null,
+          error: `Unknown task status: ${backendStatus}`,
+        });
       }
 
     } catch (error) {
       // Task not found or API error
       console.error('[TaskRecovery] Failed to recover task:', error);
 
-      // Always reset on any error - the task is no longer valid
-      // This handles 404 (task not found) and any other API errors
-      if (isDev) {
-        console.log('[TaskRecovery] Task not recoverable, clearing state...');
+      if (isTaskNotFoundError(error)) {
+        // 404/task-not-found means task is gone: clear stale persisted state
+        if (isDev) {
+          console.log('[TaskRecovery] Task not recoverable, clearing state...');
+        }
+        reset();
+        setNeedsRecovery(false);
+        setRecoveryState({
+          isRecovering: false,
+          recoveredTaskId: null,
+          error: null,
+        });
+        return;
       }
-      reset();
 
+      // Preserve active state on transient API errors so pending/running tasks can continue recovering.
+      setNeedsRecovery(true);
       setRecoveryState({
         isRecovering: false,
         recoveredTaskId: null,
-        error: null, // Don't show error - just clear state
+        error: 'Recovery check failed. Retrying on reconnect.',
       });
     }
   }, [
@@ -177,7 +262,6 @@ export function useTaskRecovery() {
     activeTaskId,
     workflowType,
     status,
-    setActiveTask,
     setStatus,
     setSteps,
     updateProgress,

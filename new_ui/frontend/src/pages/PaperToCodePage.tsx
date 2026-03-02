@@ -115,6 +115,10 @@ export default function PaperToCodePage() {
     setLocal((s) => ({ ...s, uploadedFilePath: path }));
   };
 
+  const handleFileRemoved = () => {
+    setLocal((s) => ({ ...s, uploadedFilePath: null }));
+  };
+
   const handleUrlSubmit = (url: string) => {
     handleStart(url, 'url');
   };
@@ -180,7 +184,11 @@ export default function PaperToCodePage() {
             {/* Input Components */}
             {inputMethod === 'file' ? (
               <div className="space-y-4">
-                <FileUploader onFileUploaded={handleFileUploaded} disabled={isRunning} />
+                <FileUploader
+                  onFileUploaded={handleFileUploaded}
+                  onFileRemoved={handleFileRemoved}
+                  disabled={isRunning}
+                />
                 {uploadedFilePath && !isRunning && (
                   <Button
                     onClick={handleStartWithFile}

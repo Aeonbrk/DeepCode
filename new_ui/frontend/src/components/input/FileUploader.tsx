@@ -6,6 +6,7 @@ import { toast } from '../common/Toaster';
 
 interface FileUploaderProps {
   onFileUploaded: (fileId: string, path: string) => void;
+  onFileRemoved?: () => void;
   acceptedTypes?: string[];
   maxSize?: number; // in bytes
   disabled?: boolean;
@@ -13,6 +14,7 @@ interface FileUploaderProps {
 
 export default function FileUploader({
   onFileUploaded,
+  onFileRemoved,
   acceptedTypes = ['.pdf', '.md', '.txt'],
   maxSize = 100 * 1024 * 1024, // 100MB
   disabled = false,
@@ -24,6 +26,7 @@ export default function FileUploader({
     size: number;
   } | null>(null);
   const [isUploading, setIsUploading] = useState(false);
+  const [isRemoving, setIsRemoving] = useState(false);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -97,13 +100,21 @@ export default function FileUploader({
   );
 
   const removeFile = async () => {
-    if (uploadedFile) {
-      try {
-        await filesApi.delete(uploadedFile.id);
-      } catch {
-        // Ignore delete errors
-      }
-      setUploadedFile(null);
+    if (!uploadedFile || isRemoving) {
+      return;
+    }
+
+    const fileId = uploadedFile.id;
+    setUploadedFile(null);
+    onFileRemoved?.();
+    setIsRemoving(true);
+
+    try {
+      await filesApi.delete(fileId);
+    } catch {
+      // Ignore delete errors
+    } finally {
+      setIsRemoving(false);
     }
   };
 
@@ -138,7 +149,8 @@ export default function FileUploader({
             </div>
             <button
               onClick={removeFile}
-              className="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-200 rounded-lg transition-colors"
+              disabled={isRemoving}
+              className="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-200 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <X className="h-4 w-4" />
             </button>

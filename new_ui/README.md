@@ -60,7 +60,7 @@ new_ui/
 
 ### Prerequisites
 
-- Python 3.10+
+- Python 3.9+
 - Node.js 18+
 - npm or yarn
 
@@ -78,9 +78,10 @@ chmod +x scripts/start_dev.sh
 
 Backend:
 ```bash
-cd new_ui/backend
+cd <repo-root>
 pip install -r requirements.txt  # First time only
-uvicorn main:app --reload --port 8000
+cd new_ui/backend
+python -m uvicorn main:app --reload --port 8000
 ```
 
 Frontend:

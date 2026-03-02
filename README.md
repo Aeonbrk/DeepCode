@@ -576,7 +576,7 @@ Before installing DeepCode, ensure you have the following:
 
 | Requirement | Version | Purpose |
 |-------------|---------|---------|
-| **Python** | 3.9+ | Core runtime |
+| **Python** | 3.9+ | Core runtime (DeepCode + New UI backend) |
 | **Node.js** | 18+ | New UI frontend |
 | **npm** | 8+ | Package management |
 
@@ -820,7 +820,7 @@ Features: User-in-Loop, real-time progress, inline chat.
 
 ```bash
 # macOS / Linux
-./run.sh
+./run.sh  # waits for /health and exits non-zero if backend is not ready
 # or: python deepcode.py
 
 # Windows
@@ -834,6 +834,10 @@ deepcode --classic
 deepcode --cli
 # or: python cli/main_cli.py
 ```
+
+`./run.sh` auto-installs missing backend runtime dependencies (`fastapi`,
+`uvicorn`, `pydantic-settings`, `python-multipart`, `aiofiles`, `websockets`,
+`PyYAML`) into the active Python environment.
 
 </td></tr>
 </table>
